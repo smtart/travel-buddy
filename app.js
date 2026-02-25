@@ -838,10 +838,10 @@ async function loadTravelBuddies() {
 
     let users = [];
 
-    // Fetch users from Firebase or localStorage
+    // Fetch same-college users from Firebase or localStorage
     if (AppState.useFirebase && window.FirebaseService) {
         try {
-            const result = await FirebaseService.getAllUsers();
+            const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
             if (result.success) {
                 users = result.data;
             } else {
@@ -1252,11 +1252,11 @@ async function findCompanions(searchLat, searchLng) {
 async function findCompanionsLocal(userLat, userLng, currentUser) {
     let users = [];
 
-    // Fetch users from Firebase or localStorage
+    // Fetch same-college users from Firebase or localStorage
     if (AppState.useFirebase && window.FirebaseService) {
         try {
             showToast('Searching for companions...', 'info');
-            const result = await FirebaseService.getAllUsers();
+            const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
             if (result.success) {
                 users = result.data;
             } else {
@@ -1583,10 +1583,10 @@ async function loadMapUsers() {
 
     let users = [];
 
-    // Fetch users
+    // Fetch same-college users
     if (AppState.useFirebase && window.FirebaseService) {
         try {
-            const result = await FirebaseService.getAllUsers();
+            const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
             if (result.success) {
                 users = result.data;
             } else {
