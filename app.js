@@ -1104,6 +1104,12 @@ function setupFindCompanion() {
         // Pass the search coordinates
         findCompanions(searchLat, searchLng);
 
+        // Update weather badge for the searched location
+        const searchedDestName = document.getElementById('homeDestName')?.value || '';
+        if (typeof checkWeatherAndAnimate === 'function') {
+            checkWeatherAndAnimate(searchLat, searchLng, searchedDestName || undefined);
+        }
+
         // Collapse search section after searching
         closeSearchSection();
     });
@@ -2550,14 +2556,10 @@ function setupHomeLocationAutocomplete() {
                 tbPlaceText.textContent = `Near ${placeDetails.name || description.split(',')[0]}`;
             }
 
-            // Re-check weather for the new destination
+            // Re-check weather for the new searched destination
             if (typeof checkWeatherAndAnimate === 'function') {
-                // Temporarily update userData coords for weather check
-                if (AppState.userData) {
-                    AppState.userData.latitude = placeDetails.lat;
-                    AppState.userData.longitude = placeDetails.lng;
-                }
-                checkWeatherAndAnimate();
+                const searchedName = placeDetails.name || description.split(',')[0];
+                checkWeatherAndAnimate(placeDetails.lat, placeDetails.lng, searchedName);
             }
 
             // Check if map exists
@@ -3692,19 +3694,22 @@ const SnowAnimation = {
 };
 
 // Check weather and conditionally start rain, snow, or GIF background
-async function checkWeatherAndAnimate() {
+// Accepts optional overrideLat, overrideLng, overrideLocationName to use instead of saved destination
+async function checkWeatherAndAnimate(overrideLat, overrideLng, overrideLocationName) {
     const user = AppState.userData;
     if (!user) return;
 
-    const lat = parseFloat(user.latitude);
-    const lng = parseFloat(user.longitude);
+    // Use override coords if provided, otherwise fall back to saved destination
+    const lat = (overrideLat != null) ? parseFloat(overrideLat) : parseFloat(user.latitude);
+    const lng = (overrideLng != null) ? parseFloat(overrideLng) : parseFloat(user.longitude);
+    const locationLabel = overrideLocationName || user.destinationName || 'destination';
 
     if (isNaN(lat) || isNaN(lng)) {
         console.log('🌧️ No destination coordinates, skipping weather check');
         return;
     }
 
-    console.log(`🌧️ Checking weather at destination (${lat}, ${lng})...`);
+    console.log(`🌧️ Checking weather at ${locationLabel} (${lat}, ${lng})...`);
 
     const weatherData = await WeatherService.fetchWeather(lat, lng);
 
@@ -3715,7 +3720,7 @@ async function checkWeatherAndAnimate() {
 
     const desc = WeatherService.getDescription(weatherData);
     const temp = weatherData.main?.temp;
-    console.log(`🌧️ Weather at destination: ${desc}, ${temp}°C`);
+    console.log(`🌧️ Weather at ${locationLabel}: ${desc}, ${temp}°C`);
 
     // Stop all weather animations first
     RainAnimation.stop();
@@ -3745,7 +3750,7 @@ async function checkWeatherAndAnimate() {
         if (homeHeader) {
             const badge = document.createElement('div');
             badge.className = 'weather-badge';
-            badge.innerHTML = `<i class="fas fa-cloud-rain"></i> ${desc} at destination · ${Math.round(temp)}°C`;
+            badge.innerHTML = `<i class="fas fa-cloud-rain"></i> ${desc} at ${locationLabel} · ${Math.round(temp)}°C`;
             homeHeader.appendChild(badge);
         }
 
@@ -3761,7 +3766,7 @@ async function checkWeatherAndAnimate() {
             badge.style.background = 'hsla(200, 80%, 70%, 0.12)';
             badge.style.borderColor = 'hsla(200, 80%, 70%, 0.25)';
             badge.style.color = 'hsl(200, 80%, 80%)';
-            badge.innerHTML = `<i class="fas fa-snowflake"></i> ${desc} at destination · ${Math.round(temp)}°C`;
+            badge.innerHTML = `<i class="fas fa-snowflake"></i> ${desc} at ${locationLabel} · ${Math.round(temp)}°C`;
             homeHeader.appendChild(badge);
         }
 
@@ -3791,7 +3796,7 @@ async function checkWeatherAndAnimate() {
             badge.style.background = 'hsla(40, 80%, 50%, 0.12)';
             badge.style.borderColor = 'hsla(40, 80%, 50%, 0.2)';
             badge.style.color = 'hsl(40, 80%, 70%)';
-            badge.innerHTML = `<i class="fas ${icon}"></i> ${desc} at destination · ${Math.round(temp)}°C`;
+            badge.innerHTML = `<i class="fas ${icon}"></i> ${desc} at ${locationLabel} · ${Math.round(temp)}°C`;
             homeHeader.appendChild(badge);
         }
     }
