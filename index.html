@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#111318">
+    <title>Travel Buddy — Find Your Perfect Travel Companion</title>
+    <meta name="description"
+        content="Find your perfect travel companion for college commute. Connect with students traveling the same route.">
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Background Animation -->
+        <div class="bg-animation">
+            <div class="orb orb-1"></div>
+            <div class="orb orb-2"></div>
+            <div class="orb orb-3"></div>
+        </div>
+
+        <!-- Auth Pages Container -->
+        <div id="authPages" class="auth-pages">
+            <!-- Signup Page -->
+            <div id="signupPage" class="auth-page active">
+                <div class="glass-card signup-card">
+                    <div class="card-header">
+                        <h1><i class="fas fa-route"></i> Travel Buddy</h1>
+                        <p>Find your perfect travel companion</p>
+                    </div>
+
+                    <!-- Progress Bar -->
+                    <div class="progress-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                        </div>
+                        <div class="progress-steps">
+                            <span class="step active" data-step="1">1</span>
+                            <span class="step" data-step="2">2</span>
+                            <span class="step" data-step="3">3</span>
+                            <span class="step" data-step="4">4</span>
+                            <span class="step" data-step="5">5</span>
+                        </div>
+                    </div>
+
+                    <!-- Multi-Step Form -->
+                    <form id="signupForm" class="signup-form">
+                        <!-- Step 1: Basic Info -->
+                        <div class="form-step active" data-step="1">
+                            <h2>Personal Information</h2>
+                            <div class="form-group">
+                                <label><i class="fas fa-user"></i> Full Name</label>
+                                <input type="text" id="fullName" placeholder="Enter your full name" required>
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fas fa-envelope"></i> Email</label>
+                                <input type="email" id="email" placeholder="Enter your email" required>
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fas fa-lock"></i> Password</label>
+                                <div class="pw-input-wrap">
+                                    <input type="password" id="password" placeholder="Create a password" required>
+                                    <button type="button" class="pw-toggle-btn" data-target="password"
+                                        aria-label="Show password">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Step 2: College & Profile -->
+                        <div class="form-step" data-step="2">
+                            <h2>Profile Details</h2>
+                            <div class="form-group">
+                                <label><i class="fas fa-university"></i> College Name</label>
+                                <input type="text" id="collegeName" placeholder="Enter your college name" required>
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fas fa-venus-mars"></i> Gender</label>
+                                <select id="gender" required>
+                                    <option value="">Select gender</option>
+                                    <option value="male">Male</option>
+                                    <option value="female">Female</option>
+                                    <option value="other">Other</option>
+                                    <option value="prefer-not">Prefer not to say</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fas fa-camera"></i> Profile Picture</label>
+                                <div class="file-upload">
+                                    <input type="file" id="profilePic" accept="image/*">
+                                    <div class="upload-preview" id="uploadPreview">
+                                        <i class="fas fa-cloud-upload-alt"></i>
+                                        <span>Click to upload photo</span>
+                                    </div>
+                                    <img id="previewImage" class="preview-image" alt="Profile Preview">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Step 3: Starting College -->
+                        <div class="form-step" data-step="3">
+                            <h2>Starting Location</h2>
+                            <div class="form-group">
+                                <label><i class="fas fa-map-marker-alt"></i> Starting College</label>
+                                <div class="searchable-dropdown">
+                                    <input type="text" id="startingCollegeSearch" placeholder="Search for college..."
+                                        class="dropdown-search">
+                                    <div class="dropdown-list" id="collegeDropdownList">
+                                        <div class="dropdown-loading">
+                                            <i class="fas fa-spinner fa-spin"></i> Loading colleges...
+                                        </div>
+                                    </div>
+                                    <input type="hidden" id="startingCollegeId">
+                                </div>
+                                <div class="selected-college" id="selectedCollege" style="display: none;">
+                                    <img id="SelectedCollegeImg" src="" alt="College">
+                                    <div class="college-info">
+                                        <span id="SelectedCollegeName"></span>
+                                        <small id="SelectedCollegeLocation"></small>
+                                    </div>
+                                    <button type="button" class="remove-btn" id="removeCollege">
+                                        <i class="fas fa-times"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Step 4: Destination -->
+                        <div class="form-step" data-step="4">
+                            <h2>Destination Details</h2>
+                            <div class="form-group">
+                                <label><i class="fas fa-crosshairs"></i> Ending Location</label>
+                                <!-- Ola Maps Location Search -->
+                                <div class="location-search-container">
+                                    <!-- Search Input -->
+                                    <div class="search-input-wrapper">
+                                        <button type="button" id="clearSignupLocationBtn" class="clear-btn"
+                                            style="display:none;">
+                                            <i class="fas fa-circle-xmark"></i>
+                                        </button>
+                                        <input type="text" id="signupLocationSearch"
+                                            placeholder="Search for your destination..." autocomplete="off">
+                                    </div>
+
+                                    <!-- Autocomplete Dropdown -->
+                                    <div id="signupLocationSuggestions" class="suggestions-dropdown"></div>
+
+                                    <!-- Map Container -->
+                                    <div id="signupLocationMap" class="location-map"></div>
+
+                                    <!-- Hidden lat/lng and destination name storage -->
+                                    <input type="hidden" id="latitude">
+                                    <input type="hidden" id="longitude">
+                                    <input type="hidden" id="destinationName">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Step 5: Travel Preferences -->
+                        <div class="form-step" data-step="5">
+                            <h2>Travel Preferences</h2>
+                            <div class="form-group">
+                                <label><i class="fas fa-car"></i> Mode of Travel</label>
+                                <select id="travelMode" required>
+                                    <option value="">Select mode</option>
+                                    <option value="bus">🚌 Bus</option>
+                                    <option value="personal">🚗 Personal Vehicle</option>
+                                    <option value="train">🚂 Train</option>
+                                    <option value="metro">🚇 Metro</option>
+                                    <option value="bike">🏍️ Bike</option>
+                                    <option value="carpool">🚙 Carpool</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fas fa-heart"></i> Expecting from Travel Partner</label>
+                                <textarea id="expectations" placeholder="What are you looking for in a travel buddy?"
+                                    rows="3"></textarea>
+                            </div>
+                            <div class="form-group">
+                                <label><i class="fas fa-calendar-alt"></i> Days of Travel</label>
+                                <div class="days-selector">
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="monday">
+                                        <span>Mon</span>
+                                    </label>
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="tuesday">
+                                        <span>Tue</span>
+                                    </label>
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="wednesday">
+                                        <span>Wed</span>
+                                    </label>
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="thursday">
+                                        <span>Thu</span>
+                                    </label>
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="friday">
+                                        <span>Fri</span>
+                                    </label>
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="saturday">
+                                        <span>Sat</span>
+                                    </label>
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="days" value="sunday">
+                                        <span>Sun</span>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Navigation Buttons -->
+                        <div class="form-navigation">
+                            <button type="button" class="btn btn-secondary" id="prevBtn" style="display: none;">
+                                <i class="fas fa-arrow-left"></i> Previous
+                            </button>
+                            <button type="button" class="btn btn-primary" id="nextBtn">
+                                Next <i class="fas fa-arrow-right"></i>
+                            </button>
+                            <button type="submit" class="btn btn-success" id="submitBtn" style="display: none;">
+                                <i class="fas fa-check"></i> Create Account
+                            </button>
+                        </div>
+                    </form>
+
+                    <div class="auth-footer">
+                        <p>Already have an account? <a href="#" id="showLogin">Login here</a></p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Login Page -->
+            <div id="loginPage" class="auth-page">
+                <div class="glass-card login-card">
+                    <div class="card-header">
+                        <h1><i class="fas fa-route"></i> Travel Buddy</h1>
+                        <p>Welcome back!</p>
+                    </div>
+
+                    <form id="loginForm" class="login-form">
+                        <div class="form-group">
+                            <label><i class="fas fa-envelope"></i> Email</label>
+                            <input type="email" id="loginEmail" placeholder="Enter your email" required>
+                        </div>
+                        <div class="form-group">
+                            <label><i class="fas fa-lock"></i> Password</label>
+                            <div class="pw-input-wrap">
+                                <input type="password" id="loginPassword" placeholder="Enter your password" required>
+                                <button type="button" class="pw-toggle-btn" data-target="loginPassword"
+                                    aria-label="Show password">
+                                    <i class="fas fa-eye"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block">
+                            <i class="fas fa-sign-in-alt"></i> Login
+                        </button>
+                    </form>
+
+                    <div class="auth-footer">
+                        <p>Don't have an account? <a href="#" id="showSignup">Sign up here</a></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main App Container (after login) -->
+        <div id="mainApp" class="main-app" style="display: none;">
+            <!-- Home Page -->
+            <div id="homePage" class="app-page active">
+                <!-- Weather Animation Overlays (full-screen behind content) -->
+                <div id="rain-container" style="display:none;">
+                    <canvas id="rainCanvas"></canvas>
+                </div>
+                <div id="winter-container" style="display:none;">
+                    <canvas id="snowCanvas"></canvas>
+                    <div class="fog"></div>
+                    <div class="frost"></div>
+                </div>
+                <img id="bg-normal-gif" src="bg-normal.gif" alt="" style="display:none;">
+                <!-- Dark overlay for readability above weather animation -->
+                <div class="weather-overlay" id="weatherOverlay"></div>
+
+                <div class="page-content">
+                    <div class="glass-card home-card">
+                        <div class="home-header">
+                            <h1><i class="fas fa-route"></i> Find Companion</h1>
+                            <p>Discover travel buddies on your route</p>
+                        </div>
+
+                        <!-- Google Maps-style Search Bar (collapsed) -->
+                        <div class="gmap-search-bar" id="gmapSearchBar">
+                            <div class="gmap-search-pill" id="gmapSearchPill">
+                                <div class="gmap-search-icon">
+                                    <i class="fas fa-search"></i>
+                                </div>
+                                <div class="gmap-search-content">
+                                    <span class="gmap-search-label">Where are you going?</span>
+                                    <span class="gmap-search-hint" id="gmapSearchHint">Search destination & find
+                                        companions</span>
+                                </div>
+                                <div class="gmap-search-avatar" id="gmapSearchAvatar">
+                                    <i class="fas fa-sliders-h"></i>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Expanded Search Panel (hidden by default) -->
+                        <div class="search-section search-section--collapsed" id="searchSection">
+                            <div class="search-section-header">
+                                <button class="search-section-close" id="searchSectionClose">
+                                    <i class="fas fa-arrow-left"></i>
+                                </button>
+                                <h3>Find Travel Companion</h3>
+                                <div class="search-section-close-spacer"></div>
+                            </div>
+
+                            <div class="search-section-body">
+                                <div class="form-group">
+                                    <label><i class="fas fa-map-marker-alt"></i> Starting Location</label>
+                                    <div class="searchable-dropdown">
+                                        <input type="text" id="homeCollegeSearch" placeholder="Search for college..."
+                                            class="dropdown-search">
+                                        <div class="dropdown-list" id="homeCollegeDropdownList"></div>
+                                    </div>
+                                    <div class="selected-college home-selected" id="homeSelectedCollege"
+                                        style="display: none;">
+                                        <img id="homeSelectedCollegeImg" src="" alt="College">
+                                        <div class="college-info">
+                                            <span id="homeSelectedCollegeName"></span>
+                                            <small id="homeSelectedCollegeLocation"></small>
+                                        </div>
+                                        <button type="button" class="remove-btn" id="homeRemoveCollege">
+                                            <i class="fas fa-times"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="form-group" id="destinationFormGroup">
+                                    <label><i class="fas fa-flag-checkered"></i> Your Destination</label>
+
+                                    <!-- Saved destination display (shown by default if user has one) -->
+                                    <div class="saved-destination-display" id="savedDestinationDisplay"
+                                        style="display: none;">
+                                        <div class="destination-card">
+                                            <i class="fas fa-map-marker-alt"></i>
+                                            <span id="savedDestName">My saved destination</span>
+                                        </div>
+                                        <button type="button" class="btn-link" id="searchAnotherBtn">
+                                            <i class="fas fa-search-location"></i> Search for another location
+                                        </button>
+                                    </div>
+
+                                    <!-- Map-based location search (replacing manual lat/lng inputs) -->
+                                    <div class="coords-section" id="coordsSection">
+                                        <div class="location-search-container">
+                                            <div class="search-input-wrapper">
+                                                <button type="button" class="clear-btn" id="clearHomeLocationBtn"
+                                                    style="display: none;">
+                                                    <i class="fas fa-circle-xmark"></i>
+                                                </button>
+                                                <input type="text" id="homeLocationSearch"
+                                                    placeholder="Search for your destination...">
+                                            </div>
+                                            <div class="suggestions-dropdown" id="homeLocationSuggestions"></div>
+                                        </div>
+
+                                        <!-- Map Container -->
+                                        <div class="location-map-container" id="homeLocationMap" style="display: none;">
+                                        </div>
+
+                                        <!-- Hidden inputs for coordinates -->
+                                        <input type="hidden" id="homeDestLat">
+                                        <input type="hidden" id="homeDestLng">
+                                        <input type="hidden" id="homeDestName">
+
+                                        <small class="input-hint"><i class="fas fa-info-circle"></i> Search or drag the
+                                            map
+                                            to select your destination</small>
+                                        <button type="button" class="btn-link" id="useSavedDestBtn"
+                                            style="display: none;">
+                                            <i class="fas fa-bookmark"></i> Use my saved destination
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <button class="btn btn-primary btn-block find-btn" id="findCompanionBtn">
+                                    <i class="fas fa-users"></i> Find Companion
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Travel Buddies Discovery Section -->
+                        <div class="travel-buddies-section" id="travelBuddiesSection" style="display: none;">
+                            <div class="tb-header-row">
+                                <div class="tb-title-row">
+                                    <h3 class="tb-title">TRAVEL BUDDIES</h3>
+                                    <span class="tb-count-badge" id="tbCountBadge">0 Available</span>
+                                    <button class="tb-view-all" id="tbViewAll">View All</button>
+                                </div>
+                                <span class="tb-place-name" id="tbPlaceName">
+                                    <i class="fas fa-location-dot"></i>
+                                    <span id="tbPlaceText">Near your destination</span>
+                                </span>
+                            </div>
+                            <div class="tb-carousel" id="tbCarousel">
+                                <!-- Cards injected by JS -->
+                            </div>
+                        </div>
+
+                        <!-- Results Section -->
+                        <div class="results-section" id="resultsSection" style="display: none;">
+                            <div class="section-label-row">
+                                <span class="section-dot"></span>
+                                <span class="section-label-text">Travel Buddies</span>
+                            </div>
+                            <div class="section-route-info" id="sectionRouteInfo">
+                                <span class="route-label">
+                                    <i class="fas fa-circle" style="color: var(--success); font-size: 0.5rem;"></i>
+                                    <span id="resultsStartLocation">Start Location</span>
+                                </span>
+                                <span class="route-arrow"><i class="fas fa-arrow-right"></i></span>
+                                <span class="route-label">
+                                    <i class="fas fa-map-marker-alt"
+                                        style="color: var(--error); font-size: 0.65rem;"></i>
+                                    <span id="resultsEndLocation">End Location</span>
+                                </span>
+                            </div>
+                            <div class="companions-list" id="companionsList">
+                                <!-- Companions will be loaded here -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Messages Page -->
+            <div id="messagesPage" class="app-page">
+                <div class="page-content messages-content">
+                    <!-- Messages List View -->
+                    <div class="glass-card messages-card" id="messagesListView">
+                        <div class="messages-header">
+                            <h2><i class="fas fa-comments"></i> Messages</h2>
+                        </div>
+
+                        <!-- Search Bar -->
+                        <div class="messages-search">
+                            <div class="search-input-wrapper">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="userSearchInput" placeholder="Search users...">
+                            </div>
+                        </div>
+
+                        <!-- Bubble Tabs -->
+                        <div class="bubble-tabs">
+                            <button class="bubble-tab active" data-filter="all">
+                                <i class="fas fa-globe"></i> All
+                            </button>
+                            <button class="bubble-tab" data-filter="myCollege">
+                                <i class="fas fa-university"></i> My College
+                            </button>
+                        </div>
+
+                        <!-- Users List -->
+                        <div class="users-list" id="usersList">
+                            <div class="loading-users">
+                                <i class="fas fa-spinner fa-spin"></i>
+                                <span>Loading users...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Chat View -->
+                    <div class="glass-card chat-card" id="chatView" style="display: none;">
+                        <div class="chat-header">
+                            <button class="back-btn" id="backToMessages">
+                                <i class="fas fa-arrow-left"></i>
+                            </button>
+                            <div class="chat-user-info" id="chatUserInfo">
+                                <img src="" alt="User" id="chatUserImg">
+                                <div class="chat-user-details">
+                                    <h3 id="chatUserName">User Name</h3>
+                                    <span id="chatUserStatus" class="online-status">Online</span>
+                                </div>
+                            </div>
+                            <button class="info-btn" id="showUserProfile">
+                                <i class="fas fa-info-circle"></i>
+                            </button>
+                        </div>
+
+                        <div class="chat-messages" id="chatMessages">
+                            <!-- Messages will be loaded here -->
+                        </div>
+
+                        <div class="chat-input-area">
+                            <input type="text" id="messageInput" placeholder="Type a message...">
+                            <button class="send-btn" id="sendMessageBtn">
+                                <i class="fas fa-paper-plane"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dashboard Page -->
+            <div id="dashboardPage" class="app-page">
+                <div class="page-content">
+                    <div class="glass-card dashboard-card">
+                        <div class="dashboard-header">
+                            <div class="profile-section">
+                                <img id="dashboardProfilePic" src="" alt="Profile" class="profile-avatar">
+                                <div class="profile-info">
+                                    <h2 id="dashboardName">User Name</h2>
+                                    <p id="dashboardEmail">user@email.com</p>
+                                </div>
+                            </div>
+                            <button class="btn btn-danger" id="logoutBtn">
+                                <i class="fas fa-sign-out-alt"></i> Logout
+                            </button>
+                        </div>
+
+                        <div class="dashboard-content">
+                            <h3><i class="fas fa-user-circle"></i> Profile Details</h3>
+
+                            <div class="detail-grid">
+                                <div class="detail-item">
+                                    <label>Full Name</label>
+                                    <div class="detail-value">
+                                        <span id="detailFullName"></span>
+                                        <button class="edit-btn" data-field="fullName">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>Email</label>
+                                    <div class="detail-value">
+                                        <span id="detailEmail"></span>
+                                        <button class="edit-btn" data-field="email">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>College Name</label>
+                                    <div class="detail-value">
+                                        <span id="detailCollegeName"></span>
+                                        <button class="edit-btn" data-field="collegeName">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>Gender</label>
+                                    <div class="detail-value">
+                                        <span id="detailGender"></span>
+                                        <button class="edit-btn" data-field="gender">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>Starting College</label>
+                                    <div class="detail-value">
+                                        <span id="detailStartingCollege"></span>
+                                        <button class="edit-btn" data-field="startingCollege">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>Destination</label>
+                                    <div class="detail-value">
+                                        <span id="detailDestination"></span>
+                                        <button class="edit-btn" data-field="destination">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>Location (Lat, Long)</label>
+                                    <div class="detail-value">
+                                        <span id="detailLocation"></span>
+                                        <button class="edit-btn" data-field="location">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item">
+                                    <label>Travel Mode</label>
+                                    <div class="detail-value">
+                                        <span id="detailTravelMode"></span>
+                                        <button class="edit-btn" data-field="travelMode">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item full-width">
+                                    <label>Expectations</label>
+                                    <div class="detail-value">
+                                        <span id="detailExpectations"></span>
+                                        <button class="edit-btn" data-field="expectations">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="detail-item full-width">
+                                    <label>Travel Days</label>
+                                    <div class="detail-value">
+                                        <span id="detailDays"></span>
+                                        <button class="edit-btn" data-field="days">
+                                            <i class="fas fa-pencil-alt"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Map Page -->
+            <div id="mapPage" class="app-page">
+                <div class="map-page-content">
+                    <!-- Floating Search Bar -->
+                    <div class="map-search-bar">
+                        <div class="map-search-input-wrap">
+                            <i class="fas fa-search map-search-icon"></i>
+                            <input type="text" id="mapSearchInput" class="map-search-input"
+                                placeholder="Search a place to see distances...">
+                            <button class="map-search-clear" id="mapSearchClear" style="display:none;">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                        <div class="map-suggestions" id="mapSuggestions"></div>
+                    </div>
+
+                    <!-- Full Map -->
+                    <div id="buddyMap"></div>
+
+                    <!-- Bottom Sheet -->
+                    <div class="map-bottom-sheet" id="mapBottomSheet">
+                        <div class="map-sheet-handle" id="mapSheetHandle">
+                            <div class="map-sheet-handle-bar"></div>
+                        </div>
+                        <div class="map-sheet-header">
+                            <div class="map-sheet-title">
+                                <i class="fas fa-users"></i>
+                                <span id="mapSheetTitle">Travel Buddies</span>
+                            </div>
+                            <span class="map-sheet-count" id="mapSheetCount">0</span>
+                        </div>
+                        <div class="map-sheet-body" id="mapSheetBody">
+                            <!-- User cards will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Footer Navigation -->
+            <nav class="footer-nav">
+                <button class="nav-item active" data-page="home">
+                    <i class="fas fa-home"></i>
+                    <span>Home</span>
+                </button>
+                <button class="nav-item" data-page="messages">
+                    <i class="fas fa-comments"></i>
+                    <span>Messages</span>
+                </button>
+                <button class="nav-item" data-page="map">
+                    <i class="fas fa-map-marked-alt"></i>
+                    <span>Map</span>
+                </button>
+                <button class="nav-item" data-page="dashboard">
+                    <i class="fas fa-user"></i>
+                    <span>Dashboard</span>
+                </button>
+            </nav>
+        </div>
+
+        <!-- Edit Modal -->
+        <div id="editModal" class="modal">
+            <div class="modal-content glass-card">
+                <div class="modal-header">
+                    <h3 id="editModalTitle">Edit Field</h3>
+                    <button class="close-btn" id="closeEditModal">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <input type="text" id="editInput" class="edit-input">
+                        <textarea id="editTextarea" class="edit-textarea" rows="3" style="display: none;"></textarea>
+                        <select id="editSelect" class="edit-select" style="display: none;"></select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" id="cancelEdit">Cancel</button>
+                    <button class="btn btn-primary" id="saveEdit">Save</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Profile Popup Modal -->
+        <div id="profileModal" class="modal">
+            <div class="modal-content glass-card profile-modal-content">
+                <div class="modal-header">
+                    <h3>User Profile</h3>
+                    <button class="close-btn" id="closeProfileModal">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div class="modal-body profile-modal-body">
+                    <div class="profile-modal-avatar">
+                        <img id="profileModalImg" src="" alt="User Profile">
+                    </div>
+                    <h2 id="profileModalName" class="profile-modal-name">User Name</h2>
+                    <p id="profileModalEmail" class="profile-modal-email">user@email.com</p>
+
+                    <div class="profile-modal-details">
+                        <div class="profile-detail-item">
+                            <i class="fas fa-university"></i>
+                            <span id="profileModalCollege">College Name</span>
+                        </div>
+                        <div class="profile-detail-item">
+                            <i class="fas fa-venus-mars"></i>
+                            <span id="profileModalGender">Gender</span>
+                        </div>
+                        <div class="profile-detail-item">
+                            <i class="fas fa-map-marker-alt"></i>
+                            <span id="profileModalStarting">Starting Location</span>
+                        </div>
+                        <div class="profile-detail-item">
+                            <i class="fas fa-flag-checkered"></i>
+                            <span id="profileModalDestination">Destination</span>
+                        </div>
+                        <div class="profile-detail-item">
+                            <i class="fas fa-car"></i>
+                            <span id="profileModalTravelMode">Travel Mode</span>
+                        </div>
+                        <div class="profile-detail-item">
+                            <i class="fas fa-calendar-alt"></i>
+                            <span id="profileModalDays">Travel Days</span>
+                        </div>
+                        <div class="profile-detail-item full-width">
+                            <i class="fas fa-heart"></i>
+                            <span id="profileModalExpectations">Expectations</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-primary" id="startChatFromProfile">
+                        <i class="fas fa-comment"></i> Start Chat
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div id="toastContainer" class="toast-container"></div>
+    </div>
+
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-functions-compat.js"></script>
+
+    <!-- Geohash Utilities -->
+    <script src="geohash-utils.js"></script>
+
+    <!-- Firebase Configuration -->
+    <script src="firebase-config.js"></script>
+
+    <!-- Logout Confirmation Modal -->
+    <div class="modal-overlay" id="logoutModal">
+        <div class="modal-box logout-modal-box">
+            <div class="logout-modal-icon">
+                <i class="fas fa-sign-out-alt"></i>
+            </div>
+            <h3 class="logout-modal-title">Log Out?</h3>
+            <p class="logout-modal-msg">Are you sure you want to logout? You'll need to sign in again to access your
+                account.</p>
+            <div class="logout-modal-actions">
+                <button class="btn btn-secondary" id="cancelLogoutBtn">Cancel</button>
+                <button class="btn btn-danger" id="confirmLogoutBtn">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Leaflet JS for map rendering -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Ola Maps Service -->
+    <script src="ola-maps.js"></script>
+
+    <!-- Pusher for Real-time Messaging (Fallback) -->
+    <script src="https://js.pusher.com/8.2.0/pusher.min.js"></script>
+    <script src="app.js"></script>
+</body>
+
+</html>
