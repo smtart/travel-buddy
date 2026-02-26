@@ -592,11 +592,40 @@ function getFirebaseChatKey(email1, email2) {
     return [email1, email2].sort().join('_').replace(/[.#$[\]]/g, '_');
 }
 
-// Send message
+// Send message + update user_chats index for both participants
 async function sendFirebaseMessage(chatKey, message) {
     try {
+        // 1. Push the actual message to the chat
         const messagesRef = firebaseRealtimeDB.ref(`chats/${chatKey}/messages`);
         await messagesRef.push(message);
+
+        // 2. Build the lightweight index entry
+        const preview = (message.text || '').substring(0, 60);
+        const indexEntry = {
+            lastMsg: preview,
+            lastTimestamp: message.timestamp || new Date().toISOString(),
+            fromName: message.fromName || '',
+            fromEmail: message.from || ''
+        };
+
+        // 3. Write to sender's index (unread = 0 — they sent it)
+        const senderKey = sanitizeEmailForPath(message.from);
+        const recipientKey = sanitizeEmailForPath(message.to);
+
+        await firebaseRealtimeDB.ref(`user_chats/${senderKey}/${chatKey}`).set({
+            ...indexEntry,
+            unread: 0
+        });
+
+        // 4. Increment unread on recipient's index
+        const recipientRef = firebaseRealtimeDB.ref(`user_chats/${recipientKey}/${chatKey}`);
+        const recipSnap = await recipientRef.once('value');
+        const existing = recipSnap.val() || {};
+        await recipientRef.set({
+            ...indexEntry,
+            unread: (existing.unread || 0) + 1
+        });
+
         return { success: true };
     } catch (error) {
         console.error('Send message error:', error);
@@ -621,6 +650,35 @@ function listenToMessages(chatKey, callback) {
 
     // Return unsubscribe function
     return () => messagesRef.off('value');
+}
+
+// Listen ONLY to user's own tiny chat index node (efficient — not the full /chats tree)
+// Each entry: { chatKey, lastMsg, lastTimestamp, fromName, fromEmail, unread }
+function listenToUserChatIndex(userEmail, callback) {
+    if (!firebaseRealtimeDB || !userEmail) return () => { };
+    const myKey = sanitizeEmailForPath(userEmail);
+    const indexRef = firebaseRealtimeDB.ref(`user_chats/${myKey}`);
+
+    indexRef.on('value', (snapshot) => {
+        const entries = [];
+        snapshot.forEach((child) => {
+            entries.push({ chatKey: child.key, ...child.val() });
+        });
+        callback(entries);
+    });
+
+    return () => indexRef.off('value');
+}
+
+// Reset unread count in index when a chat is opened (server-side clear)
+async function clearUnreadInIndex(userEmail, chatKey) {
+    if (!firebaseRealtimeDB || !userEmail || !chatKey) return;
+    try {
+        const myKey = sanitizeEmailForPath(userEmail);
+        await firebaseRealtimeDB.ref(`user_chats/${myKey}/${chatKey}/unread`).set(0);
+    } catch (e) {
+        console.warn('clearUnreadInIndex error:', e);
+    }
 }
 
 // Get messages once
@@ -1055,6 +1113,8 @@ window.FirebaseService = {
     sendMessage: sendFirebaseMessage,
     listenToMessages,
     getMessages,
+    listenToUserChatIndex,
+    clearUnreadInIndex,
 
     // Presence
     setUserOnline,
@@ -1082,6 +1142,7 @@ window.FirebaseService = {
     joinGroup,
     leaveGroup,
     listenToGroupMessages,
-    sendGroupMessage
+    sendGroupMessage,
+    listenToAllUserChats
 };
 

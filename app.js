@@ -3009,6 +3009,7 @@ const MessagingState = {
     channel: null,
     messages: {},
     unreadCounts: {},
+    chatMeta: {},        // { [chatKey]: { lastMsg, lastTimestamp, fromName, unread } }
     replyingTo: null,
     contextMsgId: null,
     contextMsgFrom: null,
@@ -3024,7 +3025,8 @@ const MessagingState = {
     usersPage: 0,
     usersPageSize: 30,
     usersScrollObserver: null,
-    searchDebounceTimer: null
+    searchDebounceTimer: null,
+    unsubscribeAllChats: null
 };
 
 // Initialize Pusher
@@ -3162,6 +3164,51 @@ function setupMessaging() {
     // Set user online
     if (AppState.useFirebase && window.FirebaseService && AppState.userData) {
         FirebaseService.setUserOnline(AppState.userData.email);
+
+        // ── Efficient user-chat index listener ──
+        // Reads only user_chats/{myKey} (tiny index node) — not the full /chats tree
+        MessagingState.unsubscribeAllChats = FirebaseService.listenToUserChatIndex(
+            AppState.userData.email,
+            (indexEntries) => {
+                let uiNeedsUpdate = false;
+                let hasNewToast = false;
+                let toastName = '';
+
+                indexEntries.forEach(({ chatKey, lastMsg, lastTimestamp, fromName, fromEmail, unread = 0 }) => {
+                    const prev = MessagingState.chatMeta[chatKey];
+
+                    // Update index metadata (used for sorting & previews)
+                    MessagingState.chatMeta[chatKey] = { lastMsg, lastTimestamp, fromName, fromEmail, unread };
+
+                    // Detect genuinely new unread message
+                    const prevUnread = prev?.unread || 0;
+                    const isNewUnread = unread > prevUnread &&
+                        fromEmail !== AppState.userData.email &&
+                        MessagingState.currentChatUser?.email !== fromEmail;
+
+                    if (isNewUnread) {
+                        MessagingState.unreadCounts[chatKey] = unread;
+                        hasNewToast = true;
+                        toastName = fromName || 'a companion';
+                    } else if (unread === 0) {
+                        // Badge cleared (e.g. chat opened on another device)
+                        delete MessagingState.unreadCounts[chatKey];
+                    }
+
+                    uiNeedsUpdate = true;
+                });
+
+                if (hasNewToast) {
+                    showToast(`New message from ${toastName}`, 'info');
+                    saveUnreadCounts();
+                    updateNavBadge();
+                }
+
+                if (uiNeedsUpdate && MessagingState.currentFilter !== 'groups') {
+                    refreshUserListUI();
+                }
+            }
+        );
     }
 
     // Bubble tabs
@@ -3328,19 +3375,19 @@ async function loadUsersList(searchQuery = '') {
 }
 
 // ============ Refresh User List UI (Sorting & Badges) ============
-// Lightweight local re-sorting and re-rendering without fetching
+// Lightweight: sorts using chatMeta timestamp (not full message arrays)
 function refreshUserListUI() {
     const usersList = document.getElementById('usersList');
     if (!usersList || MessagingState.currentFilter === 'groups' || MessagingState.allFilteredUsers.length === 0) return;
 
-    // ===== SORT BY RECENT CHATS =====
+    // Sort by latest chat timestamp from the lightweight index
     MessagingState.allFilteredUsers.sort((a, b) => {
         const chatKeyA = getChatKey(a.email);
         const chatKeyB = getChatKey(b.email);
-        const msgsA = MessagingState.messages[chatKeyA] || [];
-        const msgsB = MessagingState.messages[chatKeyB] || [];
-        const lastA = msgsA.length > 0 ? new Date(msgsA[msgsA.length - 1].timestamp).getTime() : 0;
-        const lastB = msgsB.length > 0 ? new Date(msgsB[msgsB.length - 1].timestamp).getTime() : 0;
+        const metaA = MessagingState.chatMeta[chatKeyA];
+        const metaB = MessagingState.chatMeta[chatKeyB];
+        const lastA = metaA?.lastTimestamp ? new Date(metaA.lastTimestamp).getTime() : 0;
+        const lastB = metaB?.lastTimestamp ? new Date(metaB.lastTimestamp).getTime() : 0;
         return lastB - lastA; // Most recent first
     });
 
@@ -3383,19 +3430,28 @@ function renderUsersBatch() {
         }
 
         const chatKey = getChatKey(user.email);
-        const msgs = MessagingState.messages[chatKey] || [];
-        const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+        // Use chatMeta (from index) for preview — O(1) lookup, no iteration needed
+        const meta = MessagingState.chatMeta[chatKey];
+        const unreadCount = MessagingState.unreadCounts[chatKey] || 0;
         let previewHtml = '';
-        if (lastMsg && !lastMsg.deleted) {
-            const prefix = lastMsg.from === currentUser.email ? 'You: ' : '';
-            const previewText = prefix + (lastMsg.text || '').slice(0, 40);
-            const unreadCount = MessagingState.unreadCounts[chatKey] || 0;
+
+        if (meta?.lastMsg) {
+            const prefix = meta.fromEmail === currentUser.email ? 'You: ' : '';
+            const previewText = prefix + (meta.lastMsg || '').slice(0, 40);
             previewHtml = `<p class="last-msg-preview ${unreadCount > 0 ? 'unread' : ''}">${escapeHtml(previewText)}</p>`;
-        } else if (lastMsg && lastMsg.deleted) {
-            previewHtml = `<p class="last-msg-preview"><i>Message deleted</i></p>`;
+        } else {
+            // Fallback to stored messages if index not yet available
+            const msgs = MessagingState.messages[chatKey] || [];
+            const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+            if (lastMsg && !lastMsg.deleted) {
+                const prefix = lastMsg.from === currentUser.email ? 'You: ' : '';
+                const previewText = prefix + (lastMsg.text || '').slice(0, 40);
+                previewHtml = `<p class="last-msg-preview ${unreadCount > 0 ? 'unread' : ''}">${escapeHtml(previewText)}</p>`;
+            } else if (lastMsg?.deleted) {
+                previewHtml = `<p class="last-msg-preview"><i>Message deleted</i></p>`;
+            }
         }
 
-        const unreadCount = MessagingState.unreadCounts[chatKey] || 0;
         const unreadHtml = unreadCount > 0 ? `<span class="user-item-unread">${unreadCount}</span>` : '';
 
         return `
@@ -3535,9 +3591,12 @@ function openChat(user) {
     messagesListView.style.display = 'none';
     chatView.style.display = 'flex';
 
-    // Clear unread for this chat
+    // Clear unread for this chat (local + Firebase index)
     const chatKey = getChatKey(user.email);
     clearUnreadForChat(chatKey);
+    if (AppState.useFirebase && window.FirebaseService) {
+        FirebaseService.clearUnreadInIndex(AppState.userData.email, chatKey);
+    }
 
     // Cancel any pending reply
     cancelReply();
