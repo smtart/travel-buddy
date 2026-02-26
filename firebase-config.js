@@ -278,6 +278,286 @@ async function findNearbyUsersWithGeohash(latitude, longitude, collegeName, curr
 }
 
 /**
+ * Find same-college users near a destination — compound index query with fallback
+ * 
+ * 3-tier strategy for scaling on Firestore free tier:
+ * 
+ * TIER 1 — Compound query (requires composite index: collegeName + destinationGeohash)
+ *   Queries Firestore with WHERE collegeName == X AND geohash in range for each
+ *   of 9 neighboring cells. Only pulls users matching BOTH college AND location.
+ *   Reads: ~9 queries × only matching docs (e.g., 5-50 docs total for a city).
+ *   This is 10-100x fewer reads than a full college scan at scale.
+ * 
+ * TIER 2 — Full college scan + in-memory geohash bucketing (fallback)
+ *   If the composite index doesn't exist, Firestore throws error code
+ *   'failed-precondition'. We catch this and fall back to getUsersByCollege()
+ *   with in-memory prefix bucketing (the previous approach).
+ * 
+ * CACHE — sessionStorage with 5-minute TTL
+ *   Both tiers cache results to avoid repeat Firestore reads within a session.
+ *   Cache key includes college name + geohash prefix so different searches
+ *   get different cache entries.
+ * 
+ * To enable Tier 1: Create composite index in Firebase Console:
+ *   Collection: users | Fields: collegeName (Asc), destinationGeohash (Asc)
+ *   Or deploy firestore.indexes.json via `firebase deploy --only firestore:indexes`
+ * 
+ * @param {number} latitude - Search center latitude
+ * @param {number} longitude - Search center longitude  
+ * @param {string} collegeName - College name to filter by
+ * @param {string} currentUserEmail - Current user's email to exclude
+ * @returns {Promise<Object>} - { success, data: sorted users[], meta }
+ */
+async function findSameCollegeNearby(latitude, longitude, collegeName, currentUserEmail) {
+    try {
+        console.log(`🏫 College search: "${collegeName}" near (${latitude}, ${longitude})`);
+
+        // --- Constants ---
+        const BUCKET_PRECISION = 4; // ~39km cells for compound query
+        const MIN_NEARBY = 5;
+        const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+        // Encode search location
+        let searchPrefix = '';
+        let neighbors = [];
+        if (window.GeohashUtils) {
+            try {
+                searchPrefix = GeohashUtils.encode(latitude, longitude, BUCKET_PRECISION);
+                neighbors = GeohashUtils.getNeighbors(searchPrefix);
+            } catch (e) {
+                console.warn('   ⚠️ Geohash encoding failed', e);
+            }
+        }
+
+        // --- Check cache ---
+        const cacheKey = `tb_search_${collegeName}_${searchPrefix || 'all'}`;
+        try {
+            const cached = sessionStorage.getItem(cacheKey);
+            if (cached) {
+                const { data, timestamp, meta } = JSON.parse(cached);
+                if (Date.now() - timestamp < CACHE_TTL) {
+                    console.log(`   ⚡ Cache hit (${data.length} users, ${Math.round((Date.now() - timestamp) / 1000)}s old)`);
+                    // Recalculate distances from current search point (may differ from cached search)
+                    const recalculated = recalcDistances(data, latitude, longitude, currentUserEmail);
+                    return {
+                        success: true,
+                        data: recalculated,
+                        meta: { ...meta, cached: true }
+                    };
+                }
+            }
+        } catch (e) { /* sessionStorage may be unavailable */ }
+
+        // === TIER 1: Compound query (collegeName + geohash range) ===
+        if (searchPrefix && neighbors.length > 0) {
+            try {
+                console.log(`   🔍 Tier 1: Compound query (${neighbors.length} cells, prefix "${searchPrefix}")`);
+
+                const queryPromises = neighbors.map(async (geohashPrefix) => {
+                    const bounds = GeohashUtils.getQueryBounds(geohashPrefix);
+                    const snapshot = await firebaseDB.collection('users')
+                        .where('collegeName', '==', collegeName)
+                        .where('destinationGeohash', '>=', bounds.start)
+                        .where('destinationGeohash', '<', bounds.end)
+                        .get();
+
+                    const users = [];
+                    snapshot.forEach(doc => {
+                        users.push({ id: doc.id, ...doc.data() });
+                    });
+                    return users;
+                });
+
+                const results = await Promise.all(queryPromises);
+
+                // Deduplicate by email
+                const userMap = new Map();
+                results.flat().forEach(user => {
+                    if (user.email !== currentUserEmail) {
+                        userMap.set(user.email, user);
+                    }
+                });
+
+                let users = Array.from(userMap.values())
+                    .filter(u => !isNaN(parseFloat(u.latitude)) && !isNaN(parseFloat(u.longitude)));
+
+                const totalReads = results.reduce((sum, r) => sum + r.length, 0);
+                console.log(`   📊 Compound query: ${totalReads} docs read → ${users.length} unique eligible`);
+
+                // Calculate distances & sort ascending
+                let companions = users.map(user => {
+                    const uLat = parseFloat(user.latitude);
+                    const uLng = parseFloat(user.longitude);
+                    const distance = GeohashUtils.calculateDistance(latitude, longitude, uLat, uLng);
+                    return { ...user, distance, isExact: true };
+                });
+                companions.sort((a, b) => a.distance - b.distance);
+
+                console.log(`   ✅ Tier 1: ${companions.length} companions in ~39km area`);
+                logDistanceRange(companions);
+
+                // If enough results, return. Otherwise fall through to Tier 2 for full college scan.
+                if (companions.length >= MIN_NEARBY) {
+                    cacheResults(cacheKey, users, {
+                        college: collegeName,
+                        method: 'compound-index',
+                        cellsQueried: neighbors.length,
+                        docsRead: totalReads
+                    });
+
+                    return {
+                        success: true,
+                        data: companions,
+                        meta: {
+                            college: collegeName,
+                            totalEligible: users.length,
+                            method: 'compound-index',
+                            cellsQueried: neighbors.length,
+                            docsRead: totalReads
+                        }
+                    };
+                } else {
+                    console.log(`   🔄 Only ${companions.length} nearby — expanding to full college scan (Tier 2)`);
+                    // Fall through to Tier 2
+                }
+
+            } catch (error) {
+                // Firestore throws 'failed-precondition' when composite index is missing
+                if (error.code === 'failed-precondition' || error.message?.includes('index')) {
+                    console.warn('   ⚠️ Composite index not found, falling back to Tier 2');
+                    console.warn('   📋 Create index: Firebase Console → Firestore → Indexes');
+                    console.warn('   📋 Collection: users | Fields: collegeName (Asc), destinationGeohash (Asc)');
+                } else {
+                    console.error('   ❌ Compound query error:', error);
+                }
+                // Fall through to Tier 2
+            }
+        }
+
+        // === TIER 2: Full college scan + in-memory geohash bucketing ===
+        console.log('   🔄 Tier 2: Full college scan + in-memory bucketing');
+
+        const collegeResult = await getUsersByCollege(collegeName);
+        if (!collegeResult.success || !collegeResult.data) {
+            return { success: false, error: 'Failed to fetch college users' };
+        }
+
+        let users = collegeResult.data;
+        console.log(`   📊 Fetched ${users.length} users from same college`);
+
+        // Filter out current user and users without coordinates
+        users = users.filter(u => {
+            if (u.email === currentUserEmail) return false;
+            return !isNaN(parseFloat(u.latitude)) && !isNaN(parseFloat(u.longitude));
+        });
+        console.log(`   👥 ${users.length} eligible users`);
+
+        if (users.length === 0) {
+            return {
+                success: true,
+                data: [],
+                meta: { college: collegeName, totalEligible: 0, method: 'college-scan' }
+            };
+        }
+
+        // Geohash prefix bucketing
+        let nearbyBucket = [];
+        let fartherBucket = [];
+
+        if (searchPrefix) {
+            for (const user of users) {
+                if (user.destinationGeohash && user.destinationGeohash.startsWith(searchPrefix)) {
+                    nearbyBucket.push(user);
+                } else {
+                    fartherBucket.push(user);
+                }
+            }
+            console.log(`   📍 Buckets: nearby=${nearbyBucket.length}, farther=${fartherBucket.length}`);
+        } else {
+            nearbyBucket = users;
+        }
+
+        // Calculate distances
+        const calcDist = (user) => {
+            const uLat = parseFloat(user.latitude);
+            const uLng = parseFloat(user.longitude);
+            const distance = (window.GeohashUtils)
+                ? GeohashUtils.calculateDistance(latitude, longitude, uLat, uLng)
+                : calculateHaversineDistance(latitude, longitude, uLat, uLng);
+            return { ...user, distance, isExact: true };
+        };
+
+        let companions = nearbyBucket.map(calcDist);
+        if (companions.length < MIN_NEARBY && fartherBucket.length > 0) {
+            console.log(`   🔄 Expanding: nearby (${companions.length}) < ${MIN_NEARBY}`);
+            companions = companions.concat(fartherBucket.map(calcDist));
+        }
+
+        companions.sort((a, b) => a.distance - b.distance);
+
+        // Cache
+        cacheResults(cacheKey, users, {
+            college: collegeName,
+            method: 'college-scan-geohash',
+            totalFetched: collegeResult.data.length
+        });
+
+        console.log(`   ✅ Tier 2 success: ${companions.length} companions`);
+        logDistanceRange(companions);
+
+        return {
+            success: true,
+            data: companions,
+            meta: {
+                college: collegeName,
+                totalEligible: users.length,
+                nearbyBucket: nearbyBucket.length,
+                fartherBucket: fartherBucket.length,
+                method: 'college-scan-geohash'
+            }
+        };
+
+    } catch (error) {
+        console.error('❌ findSameCollegeNearby error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// --- Helper: Cache results to sessionStorage ---
+function cacheResults(key, users, meta) {
+    try {
+        sessionStorage.setItem(key, JSON.stringify({
+            data: users,
+            meta: meta,
+            timestamp: Date.now()
+        }));
+    } catch (e) { /* storage full or unavailable */ }
+}
+
+// --- Helper: Recalculate distances from cache (search point may differ) ---
+function recalcDistances(users, latitude, longitude, excludeEmail) {
+    const calcDist = window.GeohashUtils
+        ? GeohashUtils.calculateDistance
+        : calculateHaversineDistance;
+
+    return users
+        .filter(u => u.email !== excludeEmail && !isNaN(parseFloat(u.latitude)))
+        .map(u => ({
+            ...u,
+            distance: calcDist(latitude, longitude, parseFloat(u.latitude), parseFloat(u.longitude)),
+            isExact: true
+        }))
+        .sort((a, b) => a.distance - b.distance);
+}
+
+// --- Helper: Log distance range ---
+function logDistanceRange(companions) {
+    if (companions.length > 0) {
+        console.log(`   📏 Range: ${companions[0].distance.toFixed(2)}km → ${companions[companions.length - 1].distance.toFixed(2)}km`);
+    }
+}
+
+/**
  * Update user's geohash when their destination changes
  * Call this when saving user profile or updating destination
  */
@@ -358,6 +638,263 @@ async function getMessages(chatKey) {
     } catch (error) {
         console.error('Get messages error:', error);
         return { success: false, error: error.message };
+    }
+}
+
+// ============ Presence (Online / Offline) ============
+
+function sanitizeEmailForPath(email) {
+    return email.replace(/[.#$\[\]]/g, '_');
+}
+
+// Set user online — call on login/app load
+function setUserOnline(email) {
+    if (!firebaseRealtimeDB || !email) return;
+    const key = sanitizeEmailForPath(email);
+    const presenceRef = firebaseRealtimeDB.ref(`presence/${key}`);
+
+    presenceRef.set({ online: true, lastSeen: firebase.database.ServerValue.TIMESTAMP });
+
+    // Auto-set offline on disconnect
+    presenceRef.onDisconnect().set({
+        online: false,
+        lastSeen: firebase.database.ServerValue.TIMESTAMP
+    });
+}
+
+// Set user offline — call on logout
+function setUserOffline(email) {
+    if (!firebaseRealtimeDB || !email) return;
+    const key = sanitizeEmailForPath(email);
+    firebaseRealtimeDB.ref(`presence/${key}`).set({
+        online: false,
+        lastSeen: firebase.database.ServerValue.TIMESTAMP
+    });
+}
+
+// Listen to another user's presence
+function listenToPresence(email, callback) {
+    if (!firebaseRealtimeDB || !email) return () => { };
+    const key = sanitizeEmailForPath(email);
+    const ref = firebaseRealtimeDB.ref(`presence/${key}`);
+    ref.on('value', snap => {
+        const val = snap.val() || { online: false, lastSeen: null };
+        callback(val);
+    });
+    return () => ref.off('value');
+}
+
+// ============ Typing Indicator ============
+
+function setTyping(chatKey, email, isTyping) {
+    if (!firebaseRealtimeDB || !chatKey || !email) return;
+    const key = sanitizeEmailForPath(email);
+    const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/typing/${key}`);
+    if (isTyping) {
+        ref.set(true);
+        ref.onDisconnect().remove();
+    } else {
+        ref.remove();
+    }
+}
+
+function listenToTyping(chatKey, excludeEmail, callback) {
+    if (!firebaseRealtimeDB || !chatKey) return () => { };
+    const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/typing`);
+    const myKey = sanitizeEmailForPath(excludeEmail);
+    ref.on('value', snap => {
+        const val = snap.val() || {};
+        // Remove own typing
+        delete val[myKey];
+        const isTyping = Object.keys(val).length > 0;
+        callback(isTyping);
+    });
+    return () => ref.off('value');
+}
+
+// ============ Message Status (Ticks) ============
+
+// Update a single message status
+async function updateMessageStatus(chatKey, msgId, status) {
+    if (!firebaseRealtimeDB) return;
+    try {
+        await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}/status`).set(status);
+    } catch (e) {
+        console.error('Update message status error:', e);
+    }
+}
+
+// Mark all messages from other user as read
+async function markMessagesAsRead(chatKey, readerEmail) {
+    if (!firebaseRealtimeDB) return;
+    try {
+        const snap = await firebaseRealtimeDB.ref(`chats/${chatKey}/messages`).once('value');
+        const updates = {};
+        snap.forEach(child => {
+            const msg = child.val();
+            if (msg.from !== readerEmail && msg.status !== 'read') {
+                updates[`${child.key}/status`] = 'read';
+            }
+        });
+        if (Object.keys(updates).length > 0) {
+            await firebaseRealtimeDB.ref(`chats/${chatKey}/messages`).update(updates);
+        }
+    } catch (e) {
+        console.error('Mark messages as read error:', e);
+    }
+}
+
+// ============ Reactions ============
+
+async function toggleReaction(chatKey, msgId, emoji, email) {
+    if (!firebaseRealtimeDB) return;
+    try {
+        const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}/reactions/${emoji}`);
+        const snap = await ref.once('value');
+        const users = snap.val() || [];
+        const idx = users.indexOf(email);
+        if (idx > -1) {
+            users.splice(idx, 1);
+        } else {
+            users.push(email);
+        }
+        if (users.length === 0) {
+            await ref.remove();
+        } else {
+            await ref.set(users);
+        }
+        return { success: true };
+    } catch (e) {
+        console.error('Toggle reaction error:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+// ============ Delete / Unsend ============
+
+async function deleteMessage(chatKey, msgId, email) {
+    if (!firebaseRealtimeDB) return { success: false };
+    try {
+        // Only allow sender to delete their own message
+        const snap = await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}`).once('value');
+        const msg = snap.val();
+        if (!msg || msg.from !== email) {
+            return { success: false, error: 'Unauthorized' };
+        }
+        await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}`).update({
+            deleted: true,
+            text: ''
+        });
+        return { success: true };
+    } catch (e) {
+        console.error('Delete message error:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+// ============ Group Chat ============
+
+async function createGroup(groupData) {
+    if (!firebaseRealtimeDB) return { success: false };
+    try {
+        const groupRef = firebaseRealtimeDB.ref('groups').push();
+        const groupId = groupRef.key;
+        await groupRef.set({
+            ...groupData,
+            id: groupId,
+            createdAt: firebase.database.ServerValue.TIMESTAMP
+        });
+        return { success: true, groupId };
+    } catch (e) {
+        console.error('Create group error:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+async function getGroupsForUser(email) {
+    if (!firebaseRealtimeDB || !email) return { success: false, data: [] };
+    try {
+        const snap = await firebaseRealtimeDB.ref('groups').once('value');
+        const groups = [];
+        snap.forEach(child => {
+            const g = child.val();
+            if (g.members && g.members[sanitizeEmailForPath(email)]) {
+                groups.push({ ...g, id: child.key });
+            }
+        });
+        return { success: true, data: groups };
+    } catch (e) {
+        console.error('Get groups error:', e);
+        return { success: false, data: [] };
+    }
+}
+
+async function findMatchingGroups(college, destinationGeohash) {
+    if (!firebaseRealtimeDB) return { success: false, data: [] };
+    try {
+        const snap = await firebaseRealtimeDB.ref('groups').once('value');
+        const groups = [];
+        const prefix = destinationGeohash ? destinationGeohash.substring(0, 4) : '';
+        snap.forEach(child => {
+            const g = child.val();
+            const matchCollege = g.college && college && g.college.toLowerCase() === college.toLowerCase();
+            const matchDest = prefix && g.destinationGeohash && g.destinationGeohash.startsWith(prefix);
+            if (matchCollege || matchDest) {
+                groups.push({ ...g, id: child.key });
+            }
+        });
+        return { success: true, data: groups };
+    } catch (e) {
+        console.error('Find matching groups error:', e);
+        return { success: false, data: [] };
+    }
+}
+
+async function joinGroup(groupId, email) {
+    if (!firebaseRealtimeDB) return { success: false };
+    try {
+        const key = sanitizeEmailForPath(email);
+        await firebaseRealtimeDB.ref(`groups/${groupId}/members/${key}`).set(true);
+        return { success: true };
+    } catch (e) {
+        console.error('Join group error:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+async function leaveGroup(groupId, email) {
+    if (!firebaseRealtimeDB) return { success: false };
+    try {
+        const key = sanitizeEmailForPath(email);
+        await firebaseRealtimeDB.ref(`groups/${groupId}/members/${key}`).remove();
+        return { success: true };
+    } catch (e) {
+        console.error('Leave group error:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+function listenToGroupMessages(groupId, callback) {
+    if (!firebaseRealtimeDB) return () => { };
+    const ref = firebaseRealtimeDB.ref(`chats/group_${groupId}/messages`);
+    ref.on('value', snap => {
+        const messages = [];
+        snap.forEach(child => {
+            messages.push({ id: child.key, ...child.val() });
+        });
+        callback(messages);
+    });
+    return () => ref.off('value');
+}
+
+async function sendGroupMessage(groupId, message) {
+    if (!firebaseRealtimeDB) return { success: false };
+    try {
+        await firebaseRealtimeDB.ref(`chats/group_${groupId}/messages`).push(message);
+        return { success: true };
+    } catch (e) {
+        console.error('Send group message error:', e);
+        return { success: false, error: e.message };
     }
 }
 
@@ -482,8 +1019,9 @@ window.FirebaseService = {
     getAllUsers,
     getUsersByCollege,
 
-    // Geohash-based Search (Free Tier - 9-cell query)
+    // Geohash-based Search (Free Tier)
     findNearbyUsersGeohash: findNearbyUsersWithGeohash,
+    findSameCollegeNearby: findSameCollegeNearby,
     updateUserGeohash: updateUserGeohash,
 
     // Cloud Functions - Optimized Search (Blaze plan)
@@ -494,6 +1032,34 @@ window.FirebaseService = {
     getChatKey: getFirebaseChatKey,
     sendMessage: sendFirebaseMessage,
     listenToMessages,
-    getMessages
+    getMessages,
+
+    // Presence
+    setUserOnline,
+    setUserOffline,
+    listenToPresence,
+
+    // Typing
+    setTyping,
+    listenToTyping,
+
+    // Message Status
+    updateMessageStatus,
+    markMessagesAsRead,
+
+    // Reactions
+    toggleReaction,
+
+    // Delete
+    deleteMessage,
+
+    // Group Chat
+    createGroup,
+    getGroupsForUser,
+    findMatchingGroups,
+    joinGroup,
+    leaveGroup,
+    listenToGroupMessages,
+    sendGroupMessage
 };
 

@@ -445,6 +445,22 @@ async function handleLogin(e) {
             if (profileResult.success) {
                 AppState.userData = profileResult.data;
                 AppState.userData.firebaseUserId = userId;
+
+                // Auto-set geohash if user has coordinates but no geohash
+                if (window.GeohashUtils && AppState.userData.latitude && AppState.userData.longitude && !AppState.userData.destinationGeohash) {
+                    const lat = parseFloat(AppState.userData.latitude);
+                    const lng = parseFloat(AppState.userData.longitude);
+                    if (!isNaN(lat) && !isNaN(lng)) {
+                        const geohash = GeohashUtils.encode(lat, lng, 5);
+                        AppState.userData.destinationGeohash = geohash;
+                        console.log(`📍 Auto-generated missing geohash on login: ${geohash}`);
+                        // Save to Firestore in the background
+                        FirebaseService.updateUserProfile(userId, { destinationGeohash: geohash })
+                            .then(r => r.success ? console.log('✅ Geohash saved to Firestore') : console.warn('⚠️ Failed to save geohash'))
+                            .catch(err => console.warn('⚠️ Geohash save error:', err));
+                    }
+                }
+
                 saveToLocalStorage('travelBuddyUser', AppState.userData);
                 showToast('Welcome back!', 'success');
                 showMainApp();
@@ -804,7 +820,7 @@ function formatDistance(km) {
 const PaginationState = {
     allCompanions: [],
     currentPage: 0,
-    pageSize: 10
+    pageSize: 50
 };
 
 // ============ Travel Buddies Auto-Discovery ============
@@ -908,8 +924,8 @@ async function loadTravelBuddies() {
         return a.distance - b.distance;
     });
 
-    // Take top 10
-    const topBuddies = buddies.slice(0, 10);
+    // Take top 50
+    const topBuddies = buddies.slice(0, 50);
 
     // Store for profile modal access
     if (!PaginationState.allCompanions || PaginationState.allCompanions.length === 0) {
@@ -924,14 +940,17 @@ async function loadTravelBuddies() {
 }
 
 function renderTravelBuddyCards(buddies, container) {
+    // Cache all buddies for profile modal lookup
+    buddies.forEach(b => cacheUser(b));
+
     const cardsHtml = buddies.map(buddy => {
         const distanceText = buddy.distance < 9999 ? formatDistance(buddy.distance) + ' away' : 'Distance N/A';
         const collegeName = buddy.collegeName || 'Unknown College';
         // Truncate college name for badge
-        const collegeShort = collegeName.length > 20 ? collegeName.slice(0, 18) + 'â€¦' : collegeName;
+        const collegeShort = collegeName.length > 20 ? collegeName.slice(0, 18) + '…' : collegeName;
 
         return `
-            <div class="tb-card" onclick="openProfileModal(getUserByEmail('${buddy.email}'))" data-email="${buddy.email}">
+            <div class="tb-card" onclick="openProfileModalByEmail('${buddy.email}')" data-email="${buddy.email}">
                 <div class="tb-avatar-wrap">
                     <img src="${buddy.profilePic || 'https://via.placeholder.com/72'}" alt="${buddy.fullName}" loading="lazy">
                     <span class="tb-online-dot"></span>
@@ -1205,25 +1224,22 @@ async function findCompanions(searchLat, searchLng) {
     // Store search coords for reference
     PaginationState.searchCoords = { lat: userLat, lng: userLng };
 
-    // Try 9-cell Geohash query first (works on free tier!)
-    if (AppState.useFirebase && window.FirebaseService && window.FirebaseService.findNearbyUsersGeohash) {
-        try {
-            showToast('Searching for companions...', 'info');
-            console.log('ðŸ”² Using 9-cell Geohash query (free tier)');
+    showToast('Searching for companions...', 'info');
 
-            const result = await FirebaseService.findNearbyUsersGeohash(
+    // === PRIMARY PATH: College-first + geohash bucketing (1 Firestore read) ===
+    if (AppState.useFirebase && window.FirebaseService && window.FirebaseService.findSameCollegeNearby) {
+        try {
+            console.log('🏫 Using college-first geohash search (primary path)');
+            const result = await FirebaseService.findSameCollegeNearby(
                 userLat,
                 userLng,
                 currentUser.collegeName,
-                currentUser.email,
-                5 // Precision 5 = ~5km cells
+                currentUser.email
             );
 
             if (result.success && result.data && result.data.length > 0) {
-                console.log(`âœ… Geohash query found ${result.data.length} companions`);
-
-                // Store companions from geohash query result
                 const companions = result.data;
+                const meta = result.meta || {};
 
                 // Determine search radius for display
                 let searchRadius = '';
@@ -1234,34 +1250,77 @@ async function findCompanions(searchLat, searchLng) {
                 }
 
                 PaginationState.searchRadius = searchRadius;
-                PaginationState.filterLevel = 'Same college (Geohash)';
+                PaginationState.filterLevel = 'Same college';
+                PaginationState.collegeName = currentUser.collegeName;
+                PaginationState.searchMeta = meta;
                 PaginationState.allCompanions = companions;
                 PaginationState.currentPage = 0;
 
-                // Render results
                 renderCompanionsPaginated();
                 return;
             } else {
-                console.warn('âš ï¸ Geohash query returned no results, falling back to local search');
+                console.warn('College-first search returned 0 results, trying 9-cell geohash fallback...');
             }
         } catch (error) {
-            console.error('âŒ Geohash query error, falling back to local search:', error);
+            console.error('College-first search error:', error);
         }
     }
 
-    // Fallback: Local search (for development or if geohash unavailable)
-    console.log('ðŸ“± Using local search (fallback mode)');
+    // === SECONDARY FALLBACK: 9-cell geohash query (for cross-college or large datasets) ===
+    if (AppState.useFirebase && window.FirebaseService && window.FirebaseService.findNearbyUsersGeohash) {
+        const precisionLevels = [5, 4, 3];
+
+        for (const precision of precisionLevels) {
+            try {
+                const precisionLabel = precision === 5 ? '~5km' : precision === 4 ? '~39km' : '~156km';
+                console.log('Trying 9-cell Geohash query at precision ' + precision + ' (' + precisionLabel + ')');
+
+                const result = await FirebaseService.findNearbyUsersGeohash(
+                    userLat,
+                    userLng,
+                    currentUser.collegeName,
+                    currentUser.email,
+                    precision
+                );
+
+                if (result.success && result.data && result.data.length > 0) {
+                    const companions = result.data;
+
+                    let searchRadius = '';
+                    if (companions.length > 0) {
+                        const minDist = companions[0].distance;
+                        const maxDist = companions[companions.length - 1].distance;
+                        searchRadius = `${formatDistance(minDist)} - ${formatDistance(maxDist)}`;
+                    }
+
+                    PaginationState.searchRadius = searchRadius;
+                    PaginationState.filterLevel = 'Same college (Geohash p' + precision + ')';
+                    PaginationState.collegeName = currentUser.collegeName;
+                    PaginationState.allCompanions = companions;
+                    PaginationState.currentPage = 0;
+
+                    renderCompanionsPaginated();
+                    return;
+                }
+            } catch (error) {
+                console.error('Geohash query error at precision ' + precision + ':', error);
+            }
+        }
+        console.warn('All geohash precisions returned no results, falling back to local search');
+    }
+
+    // === LAST RESORT: Local search (brute-force) ===
+    console.log('Using local search (last resort)');
     await findCompanionsLocal(userLat, userLng, currentUser);
 }
 
-// Local fallback search (original implementation)
+// Local fallback search — uses geohash prefix bucketing when available
 async function findCompanionsLocal(userLat, userLng, currentUser) {
     let users = [];
 
     // Fetch same-college users from Firebase or localStorage
     if (AppState.useFirebase && window.FirebaseService) {
         try {
-            showToast('Searching for companions...', 'info');
             const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
             if (result.success) {
                 users = result.data;
@@ -1313,27 +1372,72 @@ async function findCompanionsLocal(userLat, userLng, currentUser) {
         }
     }
 
-    // Store filter level for display
+    // Store filter level and college for display
     PaginationState.filterLevel = filterLevel;
+    PaginationState.collegeName = currentUser.collegeName;
 
-    // DEBUG: Log search coordinates
-    console.log('ðŸ” Search from coordinates:', { userLat, userLng });
-    console.log('ðŸ‘¥ Eligible users:', eligibleUsers.length);
+    console.log('🔍 Local search from:', { userLat, userLng });
+    console.log('👥 Eligible users:', eligibleUsers.length);
 
-    // Step 2: Calculate distance for ALL eligible users
-    let companions = eligibleUsers.map(user => {
-        const compLat = parseFloat(user.latitude);
-        const compLng = parseFloat(user.longitude);
-        const distance = calculateDistance(userLat, userLng, compLat, compLng);
+    // Step 2: Geohash prefix bucketing + Haversine distance calculation
+    // Use geohash to skip Haversine for obviously-far users when dataset > threshold
+    const BUCKET_PRECISION = 4; // ~39km cells — city-level proximity
+    const MIN_NEARBY = 5;       // Expand to all if nearby bucket < 5
+    let companions = [];
 
-        return {
+    const hasGeohash = window.GeohashUtils && eligibleUsers.length > MIN_NEARBY;
+    let searchPrefix = '';
+
+    if (hasGeohash) {
+        try {
+            searchPrefix = GeohashUtils.encode(userLat, userLng, BUCKET_PRECISION);
+        } catch (e) {
+            // Fall through to brute-force
+        }
+    }
+
+    if (searchPrefix) {
+        // Bucket using stored destinationGeohash — O(1) string check per user
+        const nearbyBucket = [];
+        const fartherBucket = [];
+
+        for (const user of eligibleUsers) {
+            if (user.destinationGeohash && user.destinationGeohash.startsWith(searchPrefix)) {
+                nearbyBucket.push(user);
+            } else {
+                fartherBucket.push(user);
+            }
+        }
+
+        console.log(`📍 Geohash bucketing: nearby=${nearbyBucket.length}, farther=${fartherBucket.length}`);
+
+        // Compute distances for nearby bucket
+        companions = nearbyBucket.map(user => ({
             ...user,
-            distance,
+            distance: calculateDistance(userLat, userLng, parseFloat(user.latitude), parseFloat(user.longitude)),
             isExact: true
-        };
-    });
+        }));
 
-    // Sort by distance (nearest first)
+        // Expand if nearby bucket is sparse
+        if (companions.length < MIN_NEARBY && fartherBucket.length > 0) {
+            console.log(`🔄 Nearby (${companions.length}) < ${MIN_NEARBY}, computing all distances`);
+            const fartherCompanions = fartherBucket.map(user => ({
+                ...user,
+                distance: calculateDistance(userLat, userLng, parseFloat(user.latitude), parseFloat(user.longitude)),
+                isExact: true
+            }));
+            companions = companions.concat(fartherCompanions);
+        }
+    } else {
+        // Brute-force: calculate distance for all eligible users
+        companions = eligibleUsers.map(user => ({
+            ...user,
+            distance: calculateDistance(userLat, userLng, parseFloat(user.latitude), parseFloat(user.longitude)),
+            isExact: true
+        }));
+    }
+
+    // Sort ascending by distance (nearest first)
     companions.sort((a, b) => a.distance - b.distance);
 
     // Determine search radius label based on results
@@ -1344,10 +1448,7 @@ async function findCompanionsLocal(userLat, userLng, currentUser) {
         searchRadius = `${formatDistance(minDist)} - ${formatDistance(maxDist)}`;
     }
 
-    // Store search radius for display
     PaginationState.searchRadius = searchRadius;
-
-    // Store for pagination
     PaginationState.allCompanions = companions;
     PaginationState.currentPage = 0;
 
@@ -1380,7 +1481,7 @@ function renderCompanionsPaginated() {
     const startEl = document.getElementById('resultsStartLocation');
     const endEl = document.getElementById('resultsEndLocation');
     if (startEl) {
-        const startName = AppState.userData?.startingCollege?.name || AppState.userData?.collegeName || 'Your college';
+        const startName = AppState.userData?.startingCollege?.name || AppState.userData?.startingCollege?.id || 'Your location';
         startEl.textContent = startName;
     }
     if (endEl) {
@@ -1389,7 +1490,26 @@ function renderCompanionsPaginated() {
         endEl.textContent = searchedName || savedName || 'Destination';
     }
 
+    // Update college badge and count
+    const collegeRow = document.getElementById('resultsCollegeRow');
+    const collegeName = document.getElementById('resultsCollegeName');
+    const countBadge = document.getElementById('resultsCountBadge');
+
+    if (PaginationState.collegeName && collegeRow && collegeName) {
+        collegeName.textContent = PaginationState.collegeName;
+        collegeRow.style.display = 'flex';
+    } else if (collegeRow) {
+        collegeRow.style.display = 'none';
+    }
+
+    if (countBadge) {
+        countBadge.textContent = `${allCompanions.length} found`;
+    }
+
     // Build companion cards HTML
+    // Cache all companions for profile modal lookup
+    pageCompanions.forEach(c => cacheUser(c));
+
     const cardsHtml = pageCompanions.map(companion => {
         const distanceFormatted = formatDistance(companion.distance);
         const proximityClass = companion.distance < 5 ? 'nearby' : companion.distance < 20 ? 'moderate' : 'far';
@@ -1397,7 +1517,7 @@ function renderCompanionsPaginated() {
 
         return `
         <div class="companion-card enhanced" data-email="${companion.email}">
-            <div class="companion-avatar" onclick="openProfileModal(getUserByEmail('${companion.email}'))">
+            <div class="companion-avatar" onclick="openProfileModalByEmail('${companion.email}')">
                 <img src="${companion.profilePic || 'https://via.placeholder.com/60'}" alt="${companion.fullName}">
                 <span class="distance-badge ${proximityClass}">${distanceFormatted}${isEstimate ? '~' : ''}</span>
             </div>
@@ -1406,7 +1526,7 @@ function renderCompanionsPaginated() {
                 <p class="companion-college"><i class="fas fa-university"></i> ${companion.collegeName}</p>
                 <p class="companion-route">
                     <i class="fas fa-route"></i> 
-                    ${companion.startingCollege?.name || 'N/A'} â†’ ${companion.destinationName}
+                    ${capitalizeFirst(companion.startingCollege?.location || companion.startingCollege?.name || companion.startingCollege?.id || 'N/A')} → ${capitalizeFirst(companion.destinationName || 'N/A')}
                 </p>
                 <div class="companion-meta">
                     <span class="travel-mode"><i class="fas fa-${getTravelModeIcon(companion.travelMode)}"></i> ${capitalizeFirst(companion.travelMode)}</span>
@@ -1467,15 +1587,44 @@ function getTravelModeIcon(mode) {
 }
 
 // Get user by email (helper for profile modal)
+// Global cache of all rendered users keyed by email
+const _userCache = new Map();
+
+function cacheUser(user) {
+    if (user && user.email) _userCache.set(user.email, user);
+}
+
 function getUserByEmail(email) {
-    // First check companions from current search results
+    // 1. Check global user cache (populated when cards are rendered)
+    if (_userCache.has(email)) return _userCache.get(email);
+    // 2. Check current search results
     if (PaginationState.allCompanions && PaginationState.allCompanions.length > 0) {
         const fromResults = PaginationState.allCompanions.find(u => u.email === email);
-        if (fromResults) return fromResults;
+        if (fromResults) { cacheUser(fromResults); return fromResults; }
     }
-    // Fallback to localStorage
+    // 3. Fallback to localStorage
     const users = getFromLocalStorage('travelBuddyUsers') || [];
-    return users.find(u => u.email === email);
+    return users.find(u => u.email === email) || null;
+}
+
+// Open profile modal — supports async Firebase fetch if user not cached locally
+async function openProfileModalByEmail(email) {
+    let user = getUserByEmail(email);
+    if (user) { openProfileModal(user); return; }
+
+    // Try fetching from Firebase
+    if (AppState.useFirebase && window.FirebaseService) {
+        try {
+            const result = await FirebaseService.getUserByEmail(email);
+            if (result.success && result.data) {
+                cacheUser(result.data);
+                openProfileModal(result.data);
+                return;
+            }
+        } catch (e) { /* ignore */ }
+    }
+    console.warn('Could not find user for profile modal:', email);
+    showToast('Could not load user profile', 'error');
 }
 
 // Start chat with user from companion card
@@ -2761,7 +2910,7 @@ function init() {
 document.addEventListener('DOMContentLoaded', init);
 
 // ==========================================
-// MESSAGING FEATURE WITH PUSHER
+// MESSAGING FEATURE — ENHANCED
 // ==========================================
 
 // Pusher Configuration
@@ -2777,7 +2926,18 @@ const MessagingState = {
     currentChatUser: null,
     pusher: null,
     channel: null,
-    messages: {}
+    messages: {},
+    unreadCounts: {},
+    replyingTo: null,
+    contextMsgId: null,
+    contextMsgFrom: null,
+    presenceListeners: {},
+    unsubscribeMessages: null,
+    unsubscribeTyping: null,
+    unsubscribePresence: null,
+    typingTimeout: null,
+    profileModalUser: null,
+    currentGroup: null
 };
 
 // Initialize Pusher
@@ -2792,7 +2952,6 @@ function initPusher() {
         forceTLS: true
     });
 
-    // Subscribe to user's private channel
     if (AppState.userData) {
         const channelName = `chat-${AppState.userData.email.replace(/[^a-z0-9]/gi, '-')}`;
         MessagingState.channel = MessagingState.pusher.subscribe(channelName);
@@ -2815,11 +2974,19 @@ function handleIncomingMessage(data) {
         from: data.from,
         text: data.text,
         timestamp: data.timestamp,
-        type: 'received'
+        type: 'received',
+        status: 'delivered'
     });
 
     // Save to localStorage
     saveMessagesToStorage();
+
+    // Track unread if chat is NOT open with this user
+    if (MessagingState.currentChatUser?.email !== data.from) {
+        MessagingState.unreadCounts[chatKey] = (MessagingState.unreadCounts[chatKey] || 0) + 1;
+        saveUnreadCounts();
+        updateNavBadge();
+    }
 
     // Update UI if chat is open
     if (MessagingState.currentChatUser?.email === data.from) {
@@ -2830,27 +2997,57 @@ function handleIncomingMessage(data) {
 }
 
 // Get chat key for storing messages
+// Must match FirebaseService.getChatKey format (uses '_' separator + sanitizes special chars)
 function getChatKey(otherEmail) {
     const myEmail = AppState.userData?.email || '';
-    return [myEmail, otherEmail].sort().join('-');
+    if (AppState.useFirebase && window.FirebaseService) {
+        return FirebaseService.getChatKey(myEmail, otherEmail);
+    }
+    return [myEmail, otherEmail].sort().join('_').replace(/[.#$\[\]]/g, '_');
 }
 
-// Save messages to localStorage
+// ============ Unread Counts ============
+function saveUnreadCounts() {
+    saveToLocalStorage('travelBuddyUnread', MessagingState.unreadCounts);
+}
+
+function loadUnreadCounts() {
+    MessagingState.unreadCounts = getFromLocalStorage('travelBuddyUnread') || {};
+}
+
+function clearUnreadForChat(chatKey) {
+    if (MessagingState.unreadCounts[chatKey]) {
+        delete MessagingState.unreadCounts[chatKey];
+        saveUnreadCounts();
+        updateNavBadge();
+    }
+}
+
+function updateNavBadge() {
+    const badge = document.getElementById('navUnreadBadge');
+    if (!badge) return;
+    const total = Object.values(MessagingState.unreadCounts).reduce((sum, c) => sum + c, 0);
+    if (total > 0) {
+        badge.textContent = total > 99 ? '99+' : total;
+        badge.style.display = '';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+// ============ Messages Storage ============
 function saveMessagesToStorage() {
     saveToLocalStorage('travelBuddyMessages', MessagingState.messages);
 }
 
-// Load messages from localStorage
 function loadMessagesFromStorage() {
     MessagingState.messages = getFromLocalStorage('travelBuddyMessages') || {};
 }
 
-// Setup Messaging
+// ============ Setup Messaging ============
 function setupMessaging() {
-    // Elements
     const userSearchInput = document.getElementById('userSearchInput');
     const bubbleTabs = document.querySelectorAll('.bubble-tab');
-    const usersList = document.getElementById('usersList');
     const messagesListView = document.getElementById('messagesListView');
     const chatView = document.getElementById('chatView');
     const backToMessages = document.getElementById('backToMessages');
@@ -2865,8 +3062,15 @@ function setupMessaging() {
     // Initialize Pusher
     initPusher();
 
-    // Load saved messages
+    // Load saved messages + unread
     loadMessagesFromStorage();
+    loadUnreadCounts();
+    updateNavBadge();
+
+    // Set user online
+    if (AppState.useFirebase && window.FirebaseService && AppState.userData) {
+        FirebaseService.setUserOnline(AppState.userData.email);
+    }
 
     // Bubble tabs
     bubbleTabs.forEach(tab => {
@@ -2874,7 +3078,8 @@ function setupMessaging() {
             bubbleTabs.forEach(t => t.classList.remove('active'));
             tab.classList.add('active');
             MessagingState.currentFilter = tab.dataset.filter;
-            loadUsersList();
+            if (tab.dataset.filter === 'groups') loadGroupsList();
+            else loadUsersList();
         });
     });
 
@@ -2887,13 +3092,29 @@ function setupMessaging() {
     backToMessages.addEventListener('click', () => {
         chatView.style.display = 'none';
         messagesListView.style.display = 'flex';
+        cleanupChatSubscriptions();
         MessagingState.currentChatUser = null;
+        MessagingState.currentGroup = null;
+        if (MessagingState.currentFilter === 'groups') loadGroupsList();
+        else loadUsersList(); // Refresh list to show updated previews
     });
 
     // Send message
     sendMessageBtn.addEventListener('click', sendMessage);
     messageInput.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') sendMessage();
+    });
+
+    // Typing indicator — fire on input
+    messageInput.addEventListener('input', () => {
+        if (!AppState.useFirebase || !window.FirebaseService || !MessagingState.currentChatUser) return;
+        const chatKey = FirebaseService.getChatKey(AppState.userData.email, MessagingState.currentChatUser.email);
+        FirebaseService.setTyping(chatKey, AppState.userData.email, true);
+
+        clearTimeout(MessagingState.typingTimeout);
+        MessagingState.typingTimeout = setTimeout(() => {
+            FirebaseService.setTyping(chatKey, AppState.userData.email, false);
+        }, 2000);
     });
 
     // Show user profile from chat header
@@ -2903,7 +3124,7 @@ function setupMessaging() {
         }
     });
 
-    // Chat user info click (also opens profile)
+    // Chat user info click
     chatUserInfo.addEventListener('click', () => {
         if (MessagingState.currentChatUser) {
             openProfileModal(MessagingState.currentChatUser);
@@ -2924,11 +3145,45 @@ function setupMessaging() {
         }
     });
 
+    // Reply preview close
+    document.getElementById('replyPreviewClose')?.addEventListener('click', cancelReply);
+
+    // Context menu setup
+    setupContextMenu();
+
+    // Group chat setup
+    setupGroupChat();
+
     // Initial load
     loadUsersList();
 }
 
-// Load users list
+// ============ Cleanup Chat Subscriptions ============
+function cleanupChatSubscriptions() {
+    if (MessagingState.unsubscribeMessages) {
+        MessagingState.unsubscribeMessages();
+        MessagingState.unsubscribeMessages = null;
+    }
+    if (MessagingState.unsubscribeTyping) {
+        MessagingState.unsubscribeTyping();
+        MessagingState.unsubscribeTyping = null;
+    }
+    if (MessagingState.unsubscribePresence) {
+        MessagingState.unsubscribePresence();
+        MessagingState.unsubscribePresence = null;
+    }
+    // Stop typing
+    if (AppState.useFirebase && window.FirebaseService && MessagingState.currentChatUser && AppState.userData) {
+        const chatKey = FirebaseService.getChatKey(AppState.userData.email, MessagingState.currentChatUser.email);
+        FirebaseService.setTyping(chatKey, AppState.userData.email, false);
+    }
+    clearTimeout(MessagingState.typingTimeout);
+    // Hide typing indicator
+    const typingEl = document.getElementById('typingIndicator');
+    if (typingEl) typingEl.style.display = 'none';
+}
+
+// ============ Load Users List ============
 async function loadUsersList(searchQuery = '') {
     const usersList = document.getElementById('usersList');
     const currentUser = AppState.userData;
@@ -2938,12 +3193,10 @@ async function loadUsersList(searchQuery = '') {
         return;
     }
 
-    // Show loading state
     usersList.innerHTML = '<div class="loading-users"><i class="fas fa-spinner fa-spin"></i><span>Loading users...</span></div>';
 
     let users = [];
 
-    // Fetch users from Firebase or localStorage
     if (AppState.useFirebase && window.FirebaseService) {
         try {
             const result = await FirebaseService.getAllUsers();
@@ -2991,7 +3244,18 @@ async function loadUsersList(searchQuery = '') {
         return;
     }
 
-    // Pre-compute distance from current user for each item
+    // ===== SORT BY RECENT CHATS =====
+    filteredUsers.sort((a, b) => {
+        const chatKeyA = getChatKey(a.email);
+        const chatKeyB = getChatKey(b.email);
+        const msgsA = MessagingState.messages[chatKeyA] || [];
+        const msgsB = MessagingState.messages[chatKeyB] || [];
+        const lastA = msgsA.length > 0 ? new Date(msgsA[msgsA.length - 1].timestamp).getTime() : 0;
+        const lastB = msgsB.length > 0 ? new Date(msgsB[msgsB.length - 1].timestamp).getTime() : 0;
+        return lastB - lastA; // Most recent first
+    });
+
+    // Pre-compute distance
     const cuLat = parseFloat(currentUser.latitude);
     const cuLng = parseFloat(currentUser.longitude);
     const hasMyCoords = !isNaN(cuLat) && !isNaN(cuLng);
@@ -3006,19 +3270,37 @@ async function loadUsersList(searchQuery = '') {
             distHtml = `<span class="user-item-dist">${fmt}</span>`;
         }
 
+        // ===== LAST MESSAGE PREVIEW =====
+        const chatKey = getChatKey(user.email);
+        const msgs = MessagingState.messages[chatKey] || [];
+        const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+        let previewHtml = '';
+        if (lastMsg && !lastMsg.deleted) {
+            const prefix = lastMsg.from === currentUser.email ? 'You: ' : '';
+            const previewText = prefix + (lastMsg.text || '').slice(0, 40);
+            const unreadCount = MessagingState.unreadCounts[chatKey] || 0;
+            previewHtml = `<p class="last-msg-preview ${unreadCount > 0 ? 'unread' : ''}">${escapeHtml(previewText)}</p>`;
+        } else if (lastMsg && lastMsg.deleted) {
+            previewHtml = `<p class="last-msg-preview"><i>Message deleted</i></p>`;
+        }
+
+        // ===== UNREAD COUNT BADGE =====
+        const unreadCount = MessagingState.unreadCounts[chatKey] || 0;
+        const unreadHtml = unreadCount > 0 ? `<span class="user-item-unread">${unreadCount}</span>` : '';
+
         return `
         <div class="user-item" data-email="${user.email}">
             <div class="user-item-avatar">
                 <img src="${user.profilePic || 'https://via.placeholder.com/50'}" alt="${user.fullName}" data-email="${user.email}" class="user-avatar-img">
-                <div class="online-indicator"></div>
+                <div class="online-indicator" id="presence-dot-${sanitizeEmailForPresence(user.email)}"></div>
             </div>
             <div class="user-item-info">
                 <h4>${user.fullName}</h4>
-                <p><i class="fas fa-university"></i> ${user.collegeName || 'N/A'}</p>
+                ${previewHtml || `<p><i class="fas fa-university"></i> ${user.collegeName || 'N/A'}</p>`}
             </div>
             <div class="user-item-meta">
                 <span class="time">${getLastMessageTime(user.email)}</span>
-                ${distHtml}
+                ${unreadHtml || distHtml}
             </div>
         </div>
     `}).join('');
@@ -3026,7 +3308,6 @@ async function loadUsersList(searchQuery = '') {
     // Add click handlers
     usersList.querySelectorAll('.user-item').forEach(item => {
         item.addEventListener('click', (e) => {
-            // Check if clicked on avatar image
             if (e.target.classList.contains('user-avatar-img')) {
                 const user = filteredUsers.find(u => u.email === e.target.dataset.email);
                 if (user) openProfileModal(user);
@@ -3036,6 +3317,19 @@ async function loadUsersList(searchQuery = '') {
             }
         });
     });
+}
+
+// Helper to sanitize email for DOM id
+function sanitizeEmailForPresence(email) {
+    // Must match sanitizeEmailForPath in firebase-config.js
+    return email.replace(/[.#$\[\]]/g, '_');
+}
+
+// Escape HTML for message text
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 // Get last message time
@@ -3055,7 +3349,7 @@ function getLastMessageTime(userEmail) {
     return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-// Open chat with user
+// ============ Open Chat ============
 function openChat(user) {
     const messagesListView = document.getElementById('messagesListView');
     const chatView = document.getElementById('chatView');
@@ -3063,11 +3357,8 @@ function openChat(user) {
     const chatUserName = document.getElementById('chatUserName');
     const chatUserStatus = document.getElementById('chatUserStatus');
 
-    // Unsubscribe from previous chat if any
-    if (MessagingState.unsubscribeMessages) {
-        MessagingState.unsubscribeMessages();
-        MessagingState.unsubscribeMessages = null;
-    }
+    // Cleanup previous subscriptions
+    cleanupChatSubscriptions();
 
     MessagingState.currentChatUser = user;
 
@@ -3076,24 +3367,73 @@ function openChat(user) {
     chatUserName.textContent = user.fullName;
     chatUserStatus.textContent = 'Online';
 
+    // Hide exit group button for 1:1 chats
+    const exitBtn = document.getElementById('exitGroupBtn');
+    if (exitBtn) exitBtn.style.display = 'none';
+
     // Hide list, show chat
     messagesListView.style.display = 'none';
     chatView.style.display = 'flex';
 
+    // Clear unread for this chat
+    const chatKey = getChatKey(user.email);
+    clearUnreadForChat(chatKey);
+
+    // Cancel any pending reply
+    cancelReply();
+
     // Subscribe to Firebase Realtime Database for this chat
     if (AppState.useFirebase && window.FirebaseService) {
-        const chatKey = FirebaseService.getChatKey(AppState.userData.email, user.email);
+        const fbChatKey = FirebaseService.getChatKey(AppState.userData.email, user.email);
 
-        MessagingState.unsubscribeMessages = FirebaseService.listenToMessages(chatKey, (messages) => {
-            // Convert Firebase messages to local format
-            MessagingState.messages[chatKey] = messages.map(msg => ({
+        // Listen to messages
+        MessagingState.unsubscribeMessages = FirebaseService.listenToMessages(fbChatKey, (messages) => {
+            MessagingState.messages[fbChatKey] = messages.map(msg => ({
                 ...msg,
                 type: msg.from === AppState.userData.email ? 'sent' : 'received'
             }));
             renderChatMessages();
+
+            // Mark received messages as read
+            FirebaseService.markMessagesAsRead(fbChatKey, AppState.userData.email);
+        });
+
+        // Listen to typing
+        MessagingState.unsubscribeTyping = FirebaseService.listenToTyping(fbChatKey, AppState.userData.email, (isTyping) => {
+            const typingEl = document.getElementById('typingIndicator');
+            if (typingEl) {
+                typingEl.style.display = isTyping ? 'flex' : 'none';
+                // Auto-scroll when typing indicator shows
+                if (isTyping) {
+                    const chatMessages = document.getElementById('chatMessages');
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                }
+            }
+        });
+
+        // Listen to presence
+        MessagingState.unsubscribePresence = FirebaseService.listenToPresence(user.email, (presence) => {
+            if (presence.online) {
+                chatUserStatus.textContent = 'Online';
+                chatUserStatus.classList.remove('offline');
+            } else if (presence.lastSeen) {
+                const lastSeen = new Date(presence.lastSeen);
+                const now = new Date();
+                let timeStr;
+                if (lastSeen.toDateString() === now.toDateString()) {
+                    timeStr = lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                } else {
+                    timeStr = lastSeen.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
+                        ' ' + lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+                chatUserStatus.textContent = `Last seen ${timeStr}`;
+                chatUserStatus.classList.add('offline');
+            } else {
+                chatUserStatus.textContent = 'Offline';
+                chatUserStatus.classList.add('offline');
+            }
         });
     } else {
-        // Fallback to localStorage
         renderChatMessages();
     }
 
@@ -3101,7 +3441,7 @@ function openChat(user) {
     document.getElementById('messageInput').focus();
 }
 
-// Render chat messages
+// ============ Render Chat Messages ============
 function renderChatMessages() {
     const chatMessages = document.getElementById('chatMessages');
     const chatKey = getChatKey(MessagingState.currentChatUser.email);
@@ -3109,33 +3449,209 @@ function renderChatMessages() {
 
     if (messages.length === 0) {
         chatMessages.innerHTML = `
-            <div class="no-users-message" style="padding: 40px;">
+            <div class="no-users-message" style="padding: 30px;">
                 <i class="fas fa-comment-dots"></i>
                 <p>Start a conversation with ${MessagingState.currentChatUser.fullName}</p>
+                <div class="quick-reply-chips">
+                    <button class="quick-chip" data-text="What bus do you take? 🚌">🚌 What bus do you take?</button>
+                    <button class="quick-chip" data-text="What time do you leave? ⏰">⏰ What time do you leave?</button>
+                    <button class="quick-chip" data-text="Where do you board? 📍">📍 Where do you board?</button>
+                    <button class="quick-chip" data-text="Want to travel together? 🤝">🤝 Travel together?</button>
+                    <button class="quick-chip" data-text="Which college are you from? 🏫">🏫 Which college?</button>
+                </div>
             </div>
         `;
+        // Attach chip click handlers
+        chatMessages.querySelectorAll('.quick-chip').forEach(chip => {
+            chip.addEventListener('click', () => {
+                document.getElementById('messageInput').value = chip.dataset.text;
+                sendMessage();
+            });
+        });
         return;
     }
 
-    chatMessages.innerHTML = messages.map(msg => `
-        <div class="message ${msg.type}">
-            <div class="message-text">${msg.text}</div>
-            <div class="message-time">${formatMessageTime(msg.timestamp)}</div>
-        </div>
-    `).join('');
+    let html = '';
+    let lastDate = '';
+
+    messages.forEach((msg, idx) => {
+        // ===== DATE SEPARATOR =====
+        const msgDate = new Date(msg.timestamp);
+        const dateKey = msgDate.toDateString();
+        if (dateKey !== lastDate) {
+            lastDate = dateKey;
+            const now = new Date();
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            let dateLabel;
+            if (dateKey === now.toDateString()) {
+                dateLabel = 'Today';
+            } else if (dateKey === yesterday.toDateString()) {
+                dateLabel = 'Yesterday';
+            } else {
+                dateLabel = msgDate.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+            }
+            html += `<div class="date-separator"><span>${dateLabel}</span></div>`;
+        }
+
+        // ===== DELETED MESSAGE =====
+        if (msg.deleted) {
+            html += `
+                <div class="message ${msg.type} deleted">
+                    <div class="message-text"><i class="fas fa-ban" style="margin-right:4px;font-size:0.75rem;"></i>This message was deleted</div>
+                    <div class="message-time">${formatMessageTime(msg.timestamp)}</div>
+                </div>
+            `;
+            return;
+        }
+
+        // ===== REPLY QUOTE =====
+        let replyHtml = '';
+        if (msg.replyTo) {
+            replyHtml = `
+                <div class="reply-quote">
+                    <span class="reply-quote-name">${escapeHtml(msg.replyTo.fromName || 'User')}</span>
+                    <span class="reply-quote-text">${escapeHtml(msg.replyTo.text || '')}</span>
+                </div>
+            `;
+        }
+
+        // ===== TICK STATUS =====
+        let tickHtml = '';
+        if (msg.type === 'sent') {
+            const status = msg.status || 'sent';
+            if (status === 'read') {
+                tickHtml = '<span class="msg-tick read"><i class="fas fa-check-double"></i></span>';
+            } else if (status === 'delivered') {
+                tickHtml = '<span class="msg-tick delivered"><i class="fas fa-check-double"></i></span>';
+            } else {
+                tickHtml = '<span class="msg-tick"><i class="fas fa-check"></i></span>';
+            }
+        }
+
+        // ===== REACTIONS =====
+        let reactionsHtml = '';
+        if (msg.reactions && typeof msg.reactions === 'object') {
+            const myEmail = AppState.userData?.email || '';
+            const badges = Object.entries(msg.reactions)
+                .filter(([, users]) => Array.isArray(users) && users.length > 0)
+                .map(([emoji, users]) => {
+                    const isMine = users.includes(myEmail);
+                    return `<span class="reaction-badge ${isMine ? 'my-reaction' : ''}" data-msg-id="${msg.id}" data-emoji="${emoji}">
+                        ${emoji}<span class="reaction-count">${users.length}</span>
+                    </span>`;
+                }).join('');
+            if (badges) {
+                reactionsHtml = `<div class="message-reactions">${badges}</div>`;
+            }
+        }
+
+        html += `
+            <div class="message-swipe-wrapper">
+                <div class="swipe-reply-icon"><i class="fas fa-reply"></i></div>
+                <div class="message ${msg.type}" data-msg-id="${msg.id || idx}" data-msg-from="${msg.from || ''}">
+                    ${replyHtml}
+                    <div class="message-text">${escapeHtml(msg.text)}</div>
+                    <div class="message-time">${formatMessageTime(msg.timestamp)}${tickHtml}</div>
+                    ${reactionsHtml}
+                </div>
+            </div>
+        `;
+    });
+
+    chatMessages.innerHTML = html;
 
     // Scroll to bottom
     chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    // Swipe-right-to-reply (WhatsApp style) + right-click context menu
+    chatMessages.querySelectorAll('.message-swipe-wrapper').forEach(wrapper => {
+        const msgEl = wrapper.querySelector('.message');
+        if (!msgEl || msgEl.classList.contains('deleted')) return;
+
+        let startX = 0, startY = 0, currentX = 0, isSwiping = false;
+        const SWIPE_THRESHOLD = 60;
+
+        wrapper.addEventListener('touchstart', (e) => {
+            startX = e.touches[0].clientX;
+            startY = e.touches[0].clientY;
+            currentX = 0;
+            isSwiping = false;
+            msgEl.style.transition = 'none';
+        }, { passive: true });
+
+        wrapper.addEventListener('touchmove', (e) => {
+            const dx = e.touches[0].clientX - startX;
+            const dy = e.touches[0].clientY - startY;
+
+            // Only swipe right, ignore vertical scrolls
+            if (!isSwiping && Math.abs(dy) > Math.abs(dx)) return;
+            if (dx < 0) return; // Don't allow left swipe
+
+            isSwiping = true;
+            currentX = Math.min(dx, 100); // Cap at 100px
+            msgEl.style.transform = `translateX(${currentX}px)`;
+
+            // Show reply icon with opacity based on progress
+            const icon = wrapper.querySelector('.swipe-reply-icon');
+            if (icon) {
+                const progress = Math.min(currentX / SWIPE_THRESHOLD, 1);
+                icon.style.opacity = progress;
+                icon.style.transform = `scale(${0.5 + progress * 0.5})`;
+            }
+        }, { passive: true });
+
+        wrapper.addEventListener('touchend', () => {
+            msgEl.style.transition = 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)';
+            msgEl.style.transform = 'translateX(0)';
+
+            const icon = wrapper.querySelector('.swipe-reply-icon');
+            if (icon) {
+                icon.style.opacity = '0';
+                icon.style.transform = 'scale(0.5)';
+            }
+
+            if (currentX >= SWIPE_THRESHOLD) {
+                // Trigger reply
+                startReply(msgEl.dataset.msgId);
+                // Haptic feedback if available
+                if (navigator.vibrate) navigator.vibrate(30);
+            }
+            isSwiping = false;
+            currentX = 0;
+        });
+
+        // Right-click context menu (desktop) — still works for reactions/delete
+        msgEl.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            openContextMenu(msgEl.dataset.msgId, msgEl.dataset.msgFrom);
+        });
+    });
+
+    // Add click handlers for reaction badges (toggle)
+    chatMessages.querySelectorAll('.reaction-badge').forEach(badge => {
+        badge.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const msgId = badge.dataset.msgId;
+            const emoji = badge.dataset.emoji;
+            handleReactionToggle(msgId, emoji);
+        });
+    });
 }
 
-// Format message time
+// ============ Format Message Time ============
 function formatMessageTime(timestamp) {
     const date = new Date(timestamp);
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-// Send message
+// ============ Send Message ============
 async function sendMessage() {
+    // Route to group chat if in group mode
+    if (MessagingState.currentGroup) {
+        return sendGroupChatMessage();
+    }
+
     const messageInput = document.getElementById('messageInput');
     const text = messageInput.value.trim();
 
@@ -3146,11 +3662,29 @@ async function sendMessage() {
         fromName: AppState.userData.fullName,
         to: MessagingState.currentChatUser.email,
         text: text,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        status: 'sent'
     };
 
-    // Clear input immediately for better UX
+    // Include reply data if replying
+    if (MessagingState.replyingTo) {
+        message.replyTo = {
+            id: MessagingState.replyingTo.id,
+            text: MessagingState.replyingTo.text,
+            fromName: MessagingState.replyingTo.fromName
+        };
+    }
+
+    // Clear input & cancel reply
     messageInput.value = '';
+    cancelReply();
+
+    // Stop typing indicator
+    if (AppState.useFirebase && window.FirebaseService) {
+        const chatKey = FirebaseService.getChatKey(AppState.userData.email, MessagingState.currentChatUser.email);
+        FirebaseService.setTyping(chatKey, AppState.userData.email, false);
+        clearTimeout(MessagingState.typingTimeout);
+    }
 
     // Send via Firebase if available
     if (AppState.useFirebase && window.FirebaseService) {
@@ -3158,11 +3692,8 @@ async function sendMessage() {
             const chatKey = FirebaseService.getChatKey(AppState.userData.email, MessagingState.currentChatUser.email);
             const result = await FirebaseService.sendMessage(chatKey, message);
 
-            if (result.success) {
-                showToast('Message sent!', 'success');
-            } else {
+            if (!result.success) {
                 console.error('Firebase send failed, falling back to Pusher');
-                // Fallback to Pusher/localStorage
                 fallbackSendMessage(message);
             }
         } catch (error) {
@@ -3170,12 +3701,11 @@ async function sendMessage() {
             fallbackSendMessage(message);
         }
     } else {
-        // Use Pusher/localStorage fallback
         fallbackSendMessage(message);
     }
 }
 
-// Fallback message sending (Pusher simulation + localStorage)
+// Fallback message sending
 function fallbackSendMessage(message) {
     const chatKey = getChatKey(message.to);
 
@@ -3183,38 +3713,597 @@ function fallbackSendMessage(message) {
         MessagingState.messages[chatKey] = [];
     }
 
-    // Add message with 'sent' type for local display
     MessagingState.messages[chatKey].push({
         ...message,
         type: 'sent'
     });
     saveMessagesToStorage();
     renderChatMessages();
-
-    // Trigger Pusher (simulated)
-    triggerPusherMessage(message);
+    showToast('Message sent!', 'success');
 }
 
-// Trigger Pusher message (simulated fallback)
-function triggerPusherMessage(message) {
-    console.log('ðŸ“¨ Message sent via Pusher (fallback):', message);
+// ============ Reply Feature ============
+function startReply(msgId) {
+    const chatKey = getChatKey(MessagingState.currentChatUser.email);
+    const messages = MessagingState.messages[chatKey] || [];
+    const msg = messages.find(m => (m.id || '') === msgId) || messages[parseInt(msgId)];
 
-    // Simulate the recipient receiving the message (for demo/fallback)
-    const recipientMessages = getFromLocalStorage('travelBuddyMessages') || {};
-    const chatKey = getChatKey(message.to);
+    if (!msg || msg.deleted) return;
 
-    if (!recipientMessages[chatKey]) {
-        recipientMessages[chatKey] = [];
+    MessagingState.replyingTo = {
+        id: msgId,
+        text: msg.text,
+        fromName: msg.from === AppState.userData?.email ? 'You' : (msg.fromName || MessagingState.currentChatUser.fullName)
+    };
+
+    // Show preview bar
+    const bar = document.getElementById('replyPreviewBar');
+    const nameEl = document.getElementById('replyPreviewName');
+    const textEl = document.getElementById('replyPreviewText');
+    if (bar && nameEl && textEl) {
+        nameEl.textContent = MessagingState.replyingTo.fromName;
+        textEl.textContent = MessagingState.replyingTo.text;
+        bar.style.display = 'flex';
     }
 
-    // Add as received for the other user
-    recipientMessages[chatKey].push({
-        ...message,
-        type: message.from === AppState.userData.email ? 'sent' : 'received'
+    document.getElementById('messageInput')?.focus();
+}
+
+function cancelReply() {
+    MessagingState.replyingTo = null;
+    const bar = document.getElementById('replyPreviewBar');
+    if (bar) bar.style.display = 'none';
+}
+
+// ============ Context Menu ============
+function setupContextMenu() {
+    const backdrop = document.getElementById('msgContextBackdrop');
+    const replyBtn = document.getElementById('msgContextReply');
+    const deleteBtn = document.getElementById('msgContextDelete');
+
+    backdrop?.addEventListener('click', closeContextMenu);
+
+    replyBtn?.addEventListener('click', () => {
+        if (MessagingState.contextMsgId != null) {
+            startReply(MessagingState.contextMsgId);
+        }
+        closeContextMenu();
     });
 
-    saveToLocalStorage('travelBuddyMessages', recipientMessages);
-    showToast('Message sent!', 'success');
+    deleteBtn?.addEventListener('click', async () => {
+        if (MessagingState.contextMsgId != null && MessagingState.contextMsgFrom === AppState.userData?.email) {
+            await handleDelete(MessagingState.contextMsgId);
+        }
+        closeContextMenu();
+    });
+
+    // Reaction picks
+    document.querySelectorAll('.reaction-pick').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const emoji = btn.dataset.emoji;
+            if (MessagingState.contextMsgId != null) {
+                handleReactionToggle(MessagingState.contextMsgId, emoji);
+            }
+            closeContextMenu();
+        });
+    });
+}
+
+function openContextMenu(msgId, msgFrom) {
+    MessagingState.contextMsgId = msgId;
+    MessagingState.contextMsgFrom = msgFrom;
+
+    const menu = document.getElementById('msgContextMenu');
+    const deleteBtn = document.getElementById('msgContextDelete');
+
+    // Only show delete for own messages
+    if (deleteBtn) {
+        deleteBtn.style.display = msgFrom === AppState.userData?.email ? 'flex' : 'none';
+    }
+
+    if (menu) menu.style.display = 'block';
+}
+
+function closeContextMenu() {
+    const menu = document.getElementById('msgContextMenu');
+    if (menu) menu.style.display = 'none';
+    MessagingState.contextMsgId = null;
+    MessagingState.contextMsgFrom = null;
+}
+
+// ============ Reactions Handler ============
+async function handleReactionToggle(msgId, emoji) {
+    if (!AppState.useFirebase || !window.FirebaseService || !MessagingState.currentChatUser) return;
+    const chatKey = FirebaseService.getChatKey(AppState.userData.email, MessagingState.currentChatUser.email);
+    await FirebaseService.toggleReaction(chatKey, msgId, emoji, AppState.userData.email);
+    // The listener will auto-update the UI
+}
+
+// ============ Delete Handler ============
+async function handleDelete(msgId) {
+    if (!AppState.useFirebase || !window.FirebaseService || !MessagingState.currentChatUser) return;
+    const chatKey = FirebaseService.getChatKey(AppState.userData.email, MessagingState.currentChatUser.email);
+    const result = await FirebaseService.deleteMessage(chatKey, msgId, AppState.userData.email);
+    if (result.success) {
+        showToast('Message deleted', 'info');
+    } else {
+        showToast('Could not delete message', 'error');
+    }
+}
+
+
+// ==========================================
+// GROUP CHAT FEATURE
+// ==========================================
+
+// Load groups list (when "Groups" tab is active)
+async function loadGroupsList() {
+    const usersList = document.getElementById('usersList');
+    const currentUser = AppState.userData;
+
+    if (!currentUser || !AppState.useFirebase || !window.FirebaseService) {
+        usersList.innerHTML = '<div class="no-users-message"><i class="fas fa-users"></i><p>Login to see groups</p></div>';
+        return;
+    }
+
+    usersList.innerHTML = '<div class="loading-users"><i class="fas fa-spinner fa-spin"></i><span>Loading groups...</span></div>';
+
+    try {
+        // Fetch existing groups
+        const result = await FirebaseService.getGroupsForUser(currentUser.email);
+        const groups = result.success ? result.data : [];
+
+        // Fetch all users to find same-route travelers
+        const usersResult = await FirebaseService.getAllUsers();
+        const allUsers = usersResult.success ? usersResult.data : [];
+
+        // Find same-route travelers (same college OR similar destination)
+        const myGeo = currentUser.destinationGeohash || '';
+        const myGeoPrefix = myGeo.substring(0, 4);
+        const myCollege = (currentUser.collegeName || '').toLowerCase();
+
+        const routeCompanions = allUsers.filter(u => {
+            if (u.email === currentUser.email) return false;
+            const sameCollege = myCollege && (u.collegeName || '').toLowerCase() === myCollege;
+            const similarDest = myGeoPrefix && u.destinationGeohash && u.destinationGeohash.startsWith(myGeoPrefix);
+            return sameCollege || similarDest;
+        });
+
+        let html = '';
+
+        // Create Group button at top
+        html += `
+            <div class="group-item" id="createGroupItem" style="border-style:dashed;justify-content:center;">
+                <i class="fas fa-plus-circle" style="color:var(--brand-light);font-size:1.1rem;"></i>
+                <span style="font-weight:600;color:var(--brand-light);font-size:0.85rem;">Create New Group</span>
+            </div>
+        `;
+
+        // Existing groups
+        if (groups.length > 0) {
+            html += groups.map(group => {
+                const memberCount = group.members ? Object.keys(group.members).length : 0;
+                return `
+                    <div class="group-item" data-group-id="${group.id}">
+                        <div class="group-avatar">🚌</div>
+                        <div class="group-item-info">
+                            <h4>${escapeHtml(group.name || 'Travel Group')}</h4>
+                            <p><i class="fas fa-map-marker-alt"></i> ${escapeHtml(group.destinationName || 'N/A')}</p>
+                        </div>
+                        <span class="group-member-count">${memberCount} <i class="fas fa-user" style="font-size:0.6rem;"></i></span>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Route companions section
+        if (routeCompanions.length > 0) {
+            html += `
+                <div style="padding:10px 4px 6px;font-size:0.78rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">
+                    <i class="fas fa-route" style="margin-right:4px;"></i> Same Route Travelers (${routeCompanions.length})
+                </div>
+            `;
+            html += routeCompanions.map(user => {
+                const sameCollege = myCollege && (user.collegeName || '').toLowerCase() === myCollege;
+                const similarDest = myGeoPrefix && user.destinationGeohash && user.destinationGeohash.startsWith(myGeoPrefix);
+                let tags = [];
+                if (sameCollege) tags.push('🏫 Same College');
+                if (similarDest) tags.push('📍 Same Route');
+                return `
+                    <div class="user-item" data-email="${user.email}">
+                        <div class="user-item-avatar">
+                            <img src="${user.profilePic || 'https://via.placeholder.com/50'}" alt="${user.fullName}" class="user-avatar-img" data-email="${user.email}">
+                        </div>
+                        <div class="user-item-info">
+                            <h4>${user.fullName}</h4>
+                            <p style="font-size:0.72rem;color:var(--brand-light);">${tags.join(' • ')}</p>
+                        </div>
+                        <div class="user-item-meta">
+                            <span style="font-size:0.7rem;color:var(--text-muted);">${user.destinationName || ''}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            // Auto-create group suggestion
+            if (groups.length === 0 && routeCompanions.length >= 2) {
+                html += `
+                    <div class="group-suggestion-banner" id="autoCreateGroupBanner" style="margin-top:8px;">
+                        <i class="fas fa-magic"></i>
+                        <div class="group-suggestion-info">
+                            <h4>Create a group with ${routeCompanions.length} travelers?</h4>
+                            <p>${currentUser.collegeName || 'Your college'} → ${currentUser.destinationName || 'destination'}</p>
+                        </div>
+                        <button class="group-suggestion-btn" id="autoCreateGroupBtn">Create</button>
+                    </div>
+                `;
+            }
+        }
+
+        if (groups.length === 0 && routeCompanions.length === 0) {
+            html += `
+                <div class="no-users-message">
+                    <i class="fas fa-users-slash"></i>
+                    <p>No groups or route matches yet</p>
+                </div>
+            `;
+        }
+
+        usersList.innerHTML = html;
+
+        // Create group handler
+        document.getElementById('createGroupItem')?.addEventListener('click', openCreateGroupModal);
+
+        // Auto-create group handler
+        document.getElementById('autoCreateGroupBtn')?.addEventListener('click', async () => {
+            const name = `${currentUser.collegeName || 'College'} → ${currentUser.destinationName || 'Destination'}`;
+            const myKey = sanitizeEmailForPresence(currentUser.email);
+            const members = { [myKey]: true };
+            // Add route companions to the group
+            routeCompanions.forEach(u => {
+                members[sanitizeEmailForPresence(u.email)] = true;
+            });
+            const groupData = {
+                name,
+                college: currentUser.collegeName || '',
+                destinationName: currentUser.destinationName || '',
+                destinationGeohash: currentUser.destinationGeohash || '',
+                createdBy: currentUser.email,
+                members
+            };
+            const res = await FirebaseService.createGroup(groupData);
+            if (res.success) {
+                showToast(`Group created with ${routeCompanions.length + 1} members!`, 'success');
+                loadGroupsList();
+            }
+        });
+
+        // Group click handlers
+        usersList.querySelectorAll('.group-item[data-group-id]').forEach(item => {
+            item.addEventListener('click', () => {
+                const group = groups.find(g => g.id === item.dataset.groupId);
+                if (group) openGroupChat(group);
+            });
+        });
+
+        // User click handlers (open 1:1 chat)
+        usersList.querySelectorAll('.user-item[data-email]').forEach(item => {
+            item.addEventListener('click', () => {
+                const user = routeCompanions.find(u => u.email === item.dataset.email);
+                if (user) openChat(user);
+            });
+        });
+
+    } catch (e) {
+        console.error('Load groups error:', e);
+        usersList.innerHTML = '<div class="no-users-message"><p>Error loading groups</p></div>';
+    }
+}
+
+// Load group suggestions (auto-suggest matching groups)
+async function loadGroupSuggestions() {
+    const area = document.getElementById('groupSuggestionArea');
+    if (!area || !AppState.userData || !AppState.useFirebase || !window.FirebaseService) return;
+
+    const user = AppState.userData;
+    if (!user.collegeName && !user.destinationGeohash) {
+        area.innerHTML = '';
+        return;
+    }
+
+    try {
+        const result = await FirebaseService.findMatchingGroups(user.collegeName, user.destinationGeohash);
+        if (!result.success || result.data.length === 0) {
+            area.innerHTML = '';
+            return;
+        }
+
+        // Filter out groups user is already in
+        const myKey = sanitizeEmailForPresence(user.email);
+        const suggestions = result.data.filter(g => !g.members || !g.members[myKey]);
+
+        if (suggestions.length === 0) {
+            area.innerHTML = '';
+            return;
+        }
+
+        // Show first suggestion
+        const group = suggestions[0];
+        const memberCount = group.members ? Object.keys(group.members).length : 0;
+
+        area.innerHTML = `
+            <div class="group-suggestion-banner" id="groupSuggestionBanner">
+                <i class="fas fa-users"></i>
+                <div class="group-suggestion-info">
+                    <h4>${escapeHtml(group.name || 'Travel Group')}</h4>
+                    <p>${memberCount} travelers • ${escapeHtml(group.destinationName || 'Same route')}</p>
+                </div>
+                <button class="group-suggestion-btn" id="joinSuggestedGroup">Join</button>
+            </div>
+        `;
+
+        document.getElementById('joinSuggestedGroup')?.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const res = await FirebaseService.joinGroup(group.id, user.email);
+            if (res.success) {
+                showToast('Joined group!', 'success');
+                area.innerHTML = '';
+                // If on groups tab, refresh
+                if (MessagingState.currentFilter === 'groups') loadGroupsList();
+            }
+        });
+    } catch (e) {
+        console.error('Group suggestions error:', e);
+    }
+}
+
+// Open group chat
+function openGroupChat(group) {
+    const messagesListView = document.getElementById('messagesListView');
+    const chatView = document.getElementById('chatView');
+    const chatUserImg = document.getElementById('chatUserImg');
+    const chatUserName = document.getElementById('chatUserName');
+    const chatUserStatus = document.getElementById('chatUserStatus');
+
+    cleanupChatSubscriptions();
+
+    // Store group info in MessagingState
+    MessagingState.currentChatUser = null;
+    MessagingState.currentGroup = group;
+
+    // Update header for group
+    chatUserImg.src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='90' height='90' viewBox='0 0 90 90'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%236366f1'/%3E%3Cstop offset='100%25' stop-color='%23a78bfa'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='45' cy='45' r='45' fill='url(%23g)'/%3E%3Ccircle cx='33' cy='32' r='9' fill='white' opacity='0.9'/%3E%3Ccircle cx='57' cy='32' r='9' fill='white' opacity='0.9'/%3E%3Cellipse cx='33' cy='52' rx='13' ry='9' fill='white' opacity='0.9'/%3E%3Cellipse cx='57' cy='52' rx='13' ry='9' fill='white' opacity='0.9'/%3E%3Ccircle cx='45' cy='28' r='10' fill='white'/%3E%3Cellipse cx='45' cy='50' rx='14' ry='10' fill='white'/%3E%3C/svg%3E";
+    chatUserName.textContent = group.name || 'Travel Group';
+    const memberCount = group.members ? Object.keys(group.members).length : 0;
+    chatUserStatus.textContent = `${memberCount} members`;
+    chatUserStatus.classList.remove('offline');
+
+    messagesListView.style.display = 'none';
+    chatView.style.display = 'flex';
+
+    // Show exit group button
+    const exitBtn = document.getElementById('exitGroupBtn');
+    if (exitBtn) {
+        exitBtn.style.display = '';
+        exitBtn.onclick = async () => {
+            if (confirm('Leave this group?')) {
+                await FirebaseService.leaveGroup(group.id, AppState.userData.email);
+                showToast('Left group', 'info');
+                cleanupChatSubscriptions();
+                MessagingState.currentGroup = null;
+                chatView.style.display = 'none';
+                messagesListView.style.display = 'flex';
+                exitBtn.style.display = 'none';
+                loadGroupsList();
+            }
+        };
+    }
+
+    cancelReply();
+
+    // Subscribe to group messages
+    if (AppState.useFirebase && window.FirebaseService) {
+        MessagingState.unsubscribeMessages = FirebaseService.listenToGroupMessages(group.id, (messages) => {
+            MessagingState.messages[`group_${group.id}`] = messages.map(msg => ({
+                ...msg,
+                type: msg.from === AppState.userData.email ? 'sent' : 'received'
+            }));
+            renderGroupMessages(group.id);
+        });
+    }
+
+    document.getElementById('messageInput').focus();
+}
+
+// Render group messages (with sender names)
+function renderGroupMessages(groupId) {
+    const chatMessages = document.getElementById('chatMessages');
+    const chatKey = `group_${groupId}`;
+    const messages = MessagingState.messages[chatKey] || [];
+
+    if (messages.length === 0) {
+        chatMessages.innerHTML = `
+            <div class="no-users-message" style="padding: 30px;">
+                <i class="fas fa-users"></i>
+                <p>Start the group conversation!</p>
+                <div class="quick-reply-chips">
+                    <button class="quick-chip" data-text="Hey everyone! 👋">👋 Hey everyone!</button>
+                    <button class="quick-chip" data-text="What time are we leaving? ⏰">⏰ What time?</button>
+                    <button class="quick-chip" data-text="Where should we meet? 📍">📍 Meeting point?</button>
+                </div>
+            </div>
+        `;
+        chatMessages.querySelectorAll('.quick-chip').forEach(chip => {
+            chip.addEventListener('click', () => {
+                document.getElementById('messageInput').value = chip.dataset.text;
+                sendMessage();
+            });
+        });
+        return;
+    }
+
+    let html = '';
+    let lastDate = '';
+
+    messages.forEach((msg, idx) => {
+        const msgDate = new Date(msg.timestamp);
+        const dateKey = msgDate.toDateString();
+        if (dateKey !== lastDate) {
+            lastDate = dateKey;
+            const now = new Date();
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            let dateLabel;
+            if (dateKey === now.toDateString()) dateLabel = 'Today';
+            else if (dateKey === yesterday.toDateString()) dateLabel = 'Yesterday';
+            else dateLabel = msgDate.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+            html += `<div class="date-separator"><span>${dateLabel}</span></div>`;
+        }
+
+        if (msg.deleted) {
+            html += `<div class="message ${msg.type} deleted"><div class="message-text"><i class="fas fa-ban" style="margin-right:4px;font-size:0.75rem;"></i>Message deleted</div><div class="message-time">${formatMessageTime(msg.timestamp)}</div></div>`;
+            return;
+        }
+
+        // Sender name for received messages in group
+        const senderHtml = msg.type === 'received' ? `<span class="group-sender-name">${escapeHtml(msg.fromName || 'User')}</span>` : '';
+
+        html += `
+            <div class="message-swipe-wrapper">
+                <div class="swipe-reply-icon"><i class="fas fa-reply"></i></div>
+                <div class="message ${msg.type}" data-msg-id="${msg.id || idx}" data-msg-from="${msg.from || ''}">
+                    ${senderHtml}
+                    <div class="message-text">${escapeHtml(msg.text)}</div>
+                    <div class="message-time">${formatMessageTime(msg.timestamp)}</div>
+                </div>
+            </div>
+        `;
+    });
+
+    chatMessages.innerHTML = html;
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    // Swipe-to-reply for group messages
+    chatMessages.querySelectorAll('.message-swipe-wrapper').forEach(wrapper => {
+        const msgEl = wrapper.querySelector('.message');
+        if (!msgEl || msgEl.classList.contains('deleted')) return;
+
+        let startX = 0, startY = 0, currentX = 0, isSwiping = false;
+        const SWIPE_THRESHOLD = 60;
+
+        wrapper.addEventListener('touchstart', (e) => {
+            startX = e.touches[0].clientX;
+            startY = e.touches[0].clientY;
+            currentX = 0; isSwiping = false;
+            msgEl.style.transition = 'none';
+        }, { passive: true });
+
+        wrapper.addEventListener('touchmove', (e) => {
+            const dx = e.touches[0].clientX - startX;
+            const dy = e.touches[0].clientY - startY;
+            if (!isSwiping && Math.abs(dy) > Math.abs(dx)) return;
+            if (dx < 0) return;
+            isSwiping = true;
+            currentX = Math.min(dx, 100);
+            msgEl.style.transform = `translateX(${currentX}px)`;
+            const icon = wrapper.querySelector('.swipe-reply-icon');
+            if (icon) { const p = Math.min(currentX / SWIPE_THRESHOLD, 1); icon.style.opacity = p; icon.style.transform = `scale(${0.5 + p * 0.5})`; }
+        }, { passive: true });
+
+        wrapper.addEventListener('touchend', () => {
+            msgEl.style.transition = 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)';
+            msgEl.style.transform = 'translateX(0)';
+            const icon = wrapper.querySelector('.swipe-reply-icon');
+            if (icon) { icon.style.opacity = '0'; icon.style.transform = 'scale(0.5)'; }
+            if (currentX >= SWIPE_THRESHOLD) { startReply(msgEl.dataset.msgId); if (navigator.vibrate) navigator.vibrate(30); }
+            isSwiping = false; currentX = 0;
+        });
+
+        msgEl.addEventListener('contextmenu', (e) => { e.preventDefault(); openContextMenu(msgEl.dataset.msgId, msgEl.dataset.msgFrom); });
+    });
+}
+
+
+async function sendGroupChatMessage() {
+    const messageInput = document.getElementById('messageInput');
+    const text = messageInput.value.trim();
+    const group = MessagingState.currentGroup;
+
+    if (!text || !group) return;
+
+    const message = {
+        from: AppState.userData.email,
+        fromName: AppState.userData.fullName,
+        text: text,
+        timestamp: new Date().toISOString(),
+        status: 'sent'
+    };
+
+    messageInput.value = '';
+    cancelReply();
+
+    if (AppState.useFirebase && window.FirebaseService) {
+        await FirebaseService.sendGroupMessage(group.id, message);
+    }
+}
+
+// Create group modal helpers
+function openCreateGroupModal() {
+    const modal = document.getElementById('createGroupModal');
+    const input = document.getElementById('groupNameInput');
+    if (modal) modal.classList.add('active');
+    if (input) {
+        const user = AppState.userData;
+        input.value = `${user?.collegeName || 'My College'} → ${user?.destinationName || 'Destination'}`;
+        input.focus();
+        input.select();
+    }
+}
+
+function closeCreateGroupModal() {
+    const modal = document.getElementById('createGroupModal');
+    if (modal) modal.classList.remove('active');
+}
+
+async function createGroupFromRoute() {
+    const input = document.getElementById('groupNameInput');
+    const name = input?.value?.trim();
+    if (!name) { showToast('Enter a group name', 'error'); return; }
+
+    const user = AppState.userData;
+    if (!user || !AppState.useFirebase || !window.FirebaseService) return;
+
+    const myKey = sanitizeEmailForPresence(user.email);
+    const groupData = {
+        name,
+        college: user.collegeName || '',
+        destinationName: user.destinationName || '',
+        destinationGeohash: user.destinationGeohash || '',
+        createdBy: user.email,
+        members: { [myKey]: true }
+    };
+
+    const result = await FirebaseService.createGroup(groupData);
+    if (result.success) {
+        closeCreateGroupModal();
+        showToast('Group created!', 'success');
+        if (MessagingState.currentFilter === 'groups') loadGroupsList();
+    } else {
+        showToast('Failed to create group', 'error');
+    }
+}
+
+// Setup group chat event listeners
+function setupGroupChat() {
+    // Create group modal
+    document.getElementById('closeCreateGroupModal')?.addEventListener('click', closeCreateGroupModal);
+    document.getElementById('confirmCreateGroup')?.addEventListener('click', createGroupFromRoute);
+    document.getElementById('createGroupModal')?.addEventListener('click', (e) => {
+        if (e.target.id === 'createGroupModal') closeCreateGroupModal();
+    });
+
+    // Load suggestions
+    loadGroupSuggestions();
 }
 
 // Open profile modal
@@ -3310,6 +4399,10 @@ function initWithMessaging() {
         confirmLogout.addEventListener('click', () => {
             closeLogoutModal();
             // Actual logout logic
+            // Set user offline before logout
+            if (AppState.useFirebase && window.FirebaseService && AppState.userData) {
+                FirebaseService.setUserOffline(AppState.userData.email);
+            }
             AppState.userData = null;
             AppState.firebaseUserId = null;
             localStorage.removeItem('travelBuddyUser');
