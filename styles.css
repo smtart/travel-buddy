@@ -1907,14 +1907,15 @@ textarea {
     min-width: 18px;
     height: 18px;
     padding: 0 5px;
-    background: #ef4444;
+    background: #25D366;
+    /* WhatsApp style green */
     border-radius: 9px;
     font-size: 0.65rem;
     font-weight: 800;
     line-height: 18px;
     text-align: center;
-    color: #fff;
-    box-shadow: 0 0 8px rgba(239, 68, 68, 0.5);
+    color: #000;
+    box-shadow: 0 0 8px rgba(37, 211, 102, 0.5);
     animation: badgePulse 2s ease-in-out infinite;
 }
 
@@ -2366,16 +2367,16 @@ textarea {
 
 /* ─── Unread count in user list item ─── */
 .user-item-unread {
-    min-width: 20px;
+    width: 20px;
     height: 20px;
-    padding: 0 6px;
-    background: var(--brand);
-    border-radius: 10px;
-    font-size: 0.68rem;
+    background: #25D366;
+    /* WhatsApp style green */
+    border-radius: 50%;
+    font-size: 0.65rem;
     font-weight: 800;
     line-height: 20px;
     text-align: center;
-    color: #fff;
+    color: #000;
     display: inline-block;
     margin-top: 4px;
 }

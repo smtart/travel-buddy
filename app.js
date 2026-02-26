@@ -3073,6 +3073,11 @@ function handleIncomingMessage(data) {
         MessagingState.unreadCounts[chatKey] = (MessagingState.unreadCounts[chatKey] || 0) + 1;
         saveUnreadCounts();
         updateNavBadge();
+
+        // Refresh the chat list UI so it jumps to top and badge updates
+        if (MessagingState.currentFilter !== 'groups') {
+            refreshUserListUI();
+        }
     }
 
     // Update UI if chat is open
@@ -3317,8 +3322,19 @@ async function loadUsersList(searchQuery = '') {
         return;
     }
 
+    // Store for pagination
+    MessagingState.allFilteredUsers = filteredUsers;
+    refreshUserListUI();
+}
+
+// ============ Refresh User List UI (Sorting & Badges) ============
+// Lightweight local re-sorting and re-rendering without fetching
+function refreshUserListUI() {
+    const usersList = document.getElementById('usersList');
+    if (!usersList || MessagingState.currentFilter === 'groups' || MessagingState.allFilteredUsers.length === 0) return;
+
     // ===== SORT BY RECENT CHATS =====
-    filteredUsers.sort((a, b) => {
+    MessagingState.allFilteredUsers.sort((a, b) => {
         const chatKeyA = getChatKey(a.email);
         const chatKeyB = getChatKey(b.email);
         const msgsA = MessagingState.messages[chatKeyA] || [];
@@ -3328,8 +3344,6 @@ async function loadUsersList(searchQuery = '') {
         return lastB - lastA; // Most recent first
     });
 
-    // Store for pagination
-    MessagingState.allFilteredUsers = filteredUsers;
     MessagingState.usersPage = 0;
 
     // Clear list and render first batch
