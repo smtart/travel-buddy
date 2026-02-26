@@ -518,6 +518,13 @@
                         </div>
 
                         <div class="chat-messages" id="chatMessages">
+                            <!-- Load older messages button — shown when 50 msg limit is hit -->
+                            <div id="loadOlderMsgsBtn" style="display:none; text-align:center; padding:8px;">
+                                <button onclick="loadOlderMessages()"
+                                    style="background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#aaa; border-radius:20px; padding:6px 16px; cursor:pointer; font-size:13px;">
+                                    ↑ Load older messages
+                                </button>
+                            </div>
                             <!-- Messages will be loaded here -->
                         </div>
 

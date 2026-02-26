@@ -754,451 +754,474 @@ async function getMessages(chatKey) {
     }
 }
 
-// ============ Presence (Online / Offline) ============
-
-function sanitizeEmailForPath(email) {
-    return email.replace(/[.#$\[\]]/g, '_');
-}
-
-// Set user online — call on login/app load
-function setUserOnline(email) {
-    if (!firebaseRealtimeDB || !email) return;
-    const key = sanitizeEmailForPath(email);
-    const presenceRef = firebaseRealtimeDB.ref(`presence/${key}`);
-
-    presenceRef.set({ online: true, lastSeen: firebase.database.ServerValue.TIMESTAMP });
-
-    // Auto-set offline on disconnect
-    presenceRef.onDisconnect().set({
-        online: false,
-        lastSeen: firebase.database.ServerValue.TIMESTAMP
-    });
-}
-
-// Set user offline — call on logout
-function setUserOffline(email) {
-    if (!firebaseRealtimeDB || !email) return;
-    const key = sanitizeEmailForPath(email);
-    firebaseRealtimeDB.ref(`presence/${key}`).set({
-        online: false,
-        lastSeen: firebase.database.ServerValue.TIMESTAMP
-    });
-}
-
-// Listen to another user's presence
-function listenToPresence(email, callback) {
-    if (!firebaseRealtimeDB || !email) return () => { };
-    const key = sanitizeEmailForPath(email);
-    const ref = firebaseRealtimeDB.ref(`presence/${key}`);
-    ref.on('value', snap => {
-        const val = snap.val() || { online: false, lastSeen: null };
-        callback(val);
-    });
-    return () => ref.off('value');
-}
-
-// ============ Typing Indicator ============
-
-function setTyping(chatKey, email, isTyping) {
-    if (!firebaseRealtimeDB || !chatKey || !email) return;
-    const key = sanitizeEmailForPath(email);
-    const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/typing/${key}`);
-    if (isTyping) {
-        ref.set(true);
-        ref.onDisconnect().remove();
-    } else {
-        ref.remove();
-    }
-}
-
-function listenToTyping(chatKey, excludeEmail, callback) {
-    if (!firebaseRealtimeDB || !chatKey) return () => { };
-    const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/typing`);
-    const myKey = sanitizeEmailForPath(excludeEmail);
-    ref.on('value', snap => {
-        const val = snap.val() || {};
-        // Remove own typing
-        delete val[myKey];
-        const isTyping = Object.keys(val).length > 0;
-        callback(isTyping);
-    });
-    return () => ref.off('value');
-}
-
-// ============ Message Status (Ticks) ============
-
-// Update a single message status
-async function updateMessageStatus(chatKey, msgId, status) {
-    if (!firebaseRealtimeDB) return;
+// Get older messages (paginate backwards) — used by "Load older messages" button
+async function getOlderMessages(chatKey, beforeKey, limit = 50) {
     try {
-        await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}/status`).set(status);
-    } catch (e) {
-        console.error('Update message status error:', e);
-    }
-}
+        const snapshot = await firebaseRealtimeDB
+            .ref(`chats/${chatKey}/messages`)
+            .orderByKey()
+            .endAt(beforeKey)
+            .limitToLast(limit + 1) // +1 so we can exclude the boundary key itself
+            .once('value');
 
-// Mark all messages from other user as read
-async function markMessagesAsRead(chatKey, readerEmail) {
-    if (!firebaseRealtimeDB) return;
-    try {
-        const snap = await firebaseRealtimeDB.ref(`chats/${chatKey}/messages`).once('value');
-        const updates = {};
-        snap.forEach(child => {
-            const msg = child.val();
-            if (msg.from !== readerEmail && msg.status !== 'read') {
-                updates[`${child.key}/status`] = 'read';
-            }
-        });
-        if (Object.keys(updates).length > 0) {
-            await firebaseRealtimeDB.ref(`chats/${chatKey}/messages`).update(updates);
-        }
-    } catch (e) {
-        console.error('Mark messages as read error:', e);
-    }
-}
-
-// ============ Reactions ============
-
-async function toggleReaction(chatKey, msgId, emoji, email) {
-    if (!firebaseRealtimeDB) return;
-    try {
-        const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}/reactions/${emoji}`);
-        const snap = await ref.once('value');
-        const users = snap.val() || [];
-        const idx = users.indexOf(email);
-        if (idx > -1) {
-            users.splice(idx, 1);
-        } else {
-            users.push(email);
-        }
-        if (users.length === 0) {
-            await ref.remove();
-        } else {
-            await ref.set(users);
-        }
-        return { success: true };
-    } catch (e) {
-        console.error('Toggle reaction error:', e);
-        return { success: false, error: e.message };
-    }
-}
-
-// ============ Delete / Unsend ============
-
-async function deleteMessage(chatKey, msgId, email) {
-    if (!firebaseRealtimeDB) return { success: false };
-    try {
-        // Only allow sender to delete their own message
-        const snap = await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}`).once('value');
-        const msg = snap.val();
-        if (!msg || msg.from !== email) {
-            return { success: false, error: 'Unauthorized' };
-        }
-        await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}`).update({
-            deleted: true,
-            text: ''
-        });
-        return { success: true };
-    } catch (e) {
-        console.error('Delete message error:', e);
-        return { success: false, error: e.message };
-    }
-}
-
-// ============ Group Chat ============
-
-async function createGroup(groupData) {
-    if (!firebaseRealtimeDB) return { success: false };
-    try {
-        const groupRef = firebaseRealtimeDB.ref('groups').push();
-        const groupId = groupRef.key;
-        await groupRef.set({
-            ...groupData,
-            id: groupId,
-            createdAt: firebase.database.ServerValue.TIMESTAMP
-        });
-        return { success: true, groupId };
-    } catch (e) {
-        console.error('Create group error:', e);
-        return { success: false, error: e.message };
-    }
-}
-
-async function getGroupsForUser(email) {
-    if (!firebaseRealtimeDB || !email || typeof email !== 'string' || !email.trim()) {
-        return { success: false, data: [] };
-    }
-    try {
-        // Race against a 10-second timeout to prevent hanging on slow connections
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('getGroupsForUser timed out')), 10000)
-        );
-        const snap = await Promise.race([
-            firebaseRealtimeDB.ref('groups').once('value'),
-            timeoutPromise
-        ]);
-        const groups = [];
-        const key = sanitizeEmailForPath(email);
-        snap.forEach(child => {
-            const g = child.val();
-            if (g && g.members && g.members[key]) {
-                groups.push({ ...g, id: child.key });
-            }
-        });
-        return { success: true, data: groups };
-    } catch (e) {
-        console.error('Get groups error:', e);
-        return { success: false, data: [] };
-    }
-}
-
-async function findMatchingGroups(college, destinationGeohash) {
-    if (!firebaseRealtimeDB) return { success: false, data: [] };
-    // If neither filter is provided, return early — nothing to match against
-    if ((!college || !college.trim()) && (!destinationGeohash || !destinationGeohash.trim())) {
-        return { success: true, data: [] };
-    }
-    try {
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('findMatchingGroups timed out')), 10000)
-        );
-        const snap = await Promise.race([
-            firebaseRealtimeDB.ref('groups').once('value'),
-            timeoutPromise
-        ]);
-        const groups = [];
-        const prefix = destinationGeohash ? destinationGeohash.substring(0, 4) : '';
-        const collegeLower = college ? college.toLowerCase() : '';
-        snap.forEach(child => {
-            const g = child.val();
-            if (!g) return;
-            const matchCollege = collegeLower && g.college && g.college.toLowerCase() === collegeLower;
-            const matchDest = prefix && g.destinationGeohash && g.destinationGeohash.startsWith(prefix);
-            if (matchCollege || matchDest) {
-                groups.push({ ...g, id: child.key });
-            }
-        });
-        return { success: true, data: groups };
-    } catch (e) {
-        console.error('Find matching groups error:', e);
-        return { success: false, data: [] };
-    }
-}
-
-async function joinGroup(groupId, email) {
-    if (!firebaseRealtimeDB) return { success: false };
-    try {
-        const key = sanitizeEmailForPath(email);
-        await firebaseRealtimeDB.ref(`groups/${groupId}/members/${key}`).set(true);
-        return { success: true };
-    } catch (e) {
-        console.error('Join group error:', e);
-        return { success: false, error: e.message };
-    }
-}
-
-async function leaveGroup(groupId, email) {
-    if (!firebaseRealtimeDB) return { success: false };
-    try {
-        const key = sanitizeEmailForPath(email);
-        await firebaseRealtimeDB.ref(`groups/${groupId}/members/${key}`).remove();
-        return { success: true };
-    } catch (e) {
-        console.error('Leave group error:', e);
-        return { success: false, error: e.message };
-    }
-}
-
-function listenToGroupMessages(groupId, callback) {
-    if (!firebaseRealtimeDB) return () => { };
-    const ref = firebaseRealtimeDB.ref(`chats/group_${groupId}/messages`);
-    ref.on('value', snap => {
         const messages = [];
-        snap.forEach(child => {
-            messages.push({ id: child.key, ...child.val() });
+        snapshot.forEach((child) => {
+            if (child.key !== beforeKey) { // exclude the message we already have
+                messages.push({ id: child.key, ...child.val() });
+            }
         });
-        callback(messages);
-    });
-    return () => ref.off('value');
-}
-
-async function sendGroupMessage(groupId, message) {
-    if (!firebaseRealtimeDB) return { success: false };
-    try {
-        await firebaseRealtimeDB.ref(`chats/group_${groupId}/messages`).push(message);
-        return { success: true };
-    } catch (e) {
-        console.error('Send group message error:', e);
-        return { success: false, error: e.message };
-    }
-}
-
-// ============ Utility: Check if Firebase is available ============
-function isFirebaseAvailable() {
-    return firebaseApp !== null && firebaseAuth !== null && firebaseDB !== null;
-}
-
-// ============ Cloud Functions Helpers ============
-
-// Initialize Firebase Functions (for region-specific calls)
-let firebaseFunctions = null;
-
-function initializeFunctions() {
-    if (typeof firebase !== 'undefined' && firebase.functions) {
-        // Use asia-south1 region (same as Cloud Function)
-        firebaseFunctions = firebase.app().functions('asia-south1');
-        console.log('⚡ Firebase Functions initialized (asia-south1)');
-        return true;
-    }
-    return false;
-}
-
-/**
- * Find nearby companions using Cloud Function
- * This is much faster than fetching all users client-side
- * 
- * @param {number} latitude - Search center latitude
- * @param {number} longitude - Search center longitude
- * @param {string} collegeName - User's college name for filtering
- * @param {string} currentUserEmail - Email of current user to exclude
- * @param {number} radiusKm - Search radius in kilometers (default: 100)
- * @returns {Promise<Object>} - Result with companions array
- */
-async function findNearbyCompanionsCloud(latitude, longitude, collegeName, currentUserEmail, radiusKm = 100) {
-    try {
-        // Initialize functions if not already
-        if (!firebaseFunctions) {
-            initializeFunctions();
-        }
-
-        if (!firebaseFunctions) {
-            console.warn('⚠️ Cloud Functions not available, falling back to local search');
-            return { success: false, error: 'Cloud Functions not initialized' };
-        }
-
-        console.log(`☁️ Calling Cloud Function: findNearbyCompanions`);
-        console.log(`   📍 Coordinates: (${latitude}, ${longitude})`);
-        console.log(`   🏫 College: ${collegeName}`);
-        console.log(`   📏 Radius: ${radiusKm}km`);
-
-        const findNearbyCompanions = firebaseFunctions.httpsCallable('findNearbyCompanions');
-
-        const result = await findNearbyCompanions({
-            latitude,
-            longitude,
-            collegeName,
-            currentUserEmail,
-            radiusKm,
-            maxResults: 50
-        });
-
-        console.log(`✅ Cloud Function returned ${result.data.count} companions`);
-        return { success: true, data: result.data };
-
+        return { success: true, data: messages };
     } catch (error) {
-        console.error('❌ Cloud Function error:', error);
+        console.error('getOlderMessages error:', error);
         return { success: false, error: error.message };
     }
-}
 
-/**
- * Progressive companion search - expands radius until enough results found
- */
-async function findCompanionsProgressiveCloud(latitude, longitude, collegeName, currentUserEmail) {
-    try {
-        if (!firebaseFunctions) {
-            initializeFunctions();
-        }
+    // ============ Presence (Online / Offline) ============
 
-        if (!firebaseFunctions) {
-            return { success: false, error: 'Cloud Functions not initialized' };
-        }
-
-        const findCompanionsProgressive = firebaseFunctions.httpsCallable('findCompanionsProgressive');
-
-        const result = await findCompanionsProgressive({
-            latitude,
-            longitude,
-            collegeName,
-            currentUserEmail,
-            minResults: 10,
-            maxRadius: 200
-        });
-
-        return { success: true, data: result.data };
-
-    } catch (error) {
-        console.error('❌ Progressive search error:', error);
-        return { success: false, error: error.message };
+    function sanitizeEmailForPath(email) {
+        return email.replace(/[.#$\[\]]/g, '_');
     }
-}
 
-// Export for use in app.js (global scope for non-module usage)
-window.FirebaseService = {
-    init: initializeFirebase,
-    isAvailable: isFirebaseAvailable,
-    initFunctions: initializeFunctions,
+    // Set user online — call on login/app load
+    function setUserOnline(email) {
+        if (!firebaseRealtimeDB || !email) return;
+        const key = sanitizeEmailForPath(email);
+        const presenceRef = firebaseRealtimeDB.ref(`presence/${key}`);
 
-    // Auth
-    signUp: firebaseSignUp,
-    signIn: firebaseSignIn,
-    signOut: firebaseSignOut,
-    getCurrentUser,
-    onAuthStateChange,
+        presenceRef.set({ online: true, lastSeen: firebase.database.ServerValue.TIMESTAMP });
 
-    // Firestore
-    saveUserProfile,
-    getUserProfile,
-    getUserByEmail: getUserByEmailFromFirestore,
-    updateUserProfile,
-    getAllUsers,
-    getUsersByCollege,
+        // Auto-set offline on disconnect
+        presenceRef.onDisconnect().set({
+            online: false,
+            lastSeen: firebase.database.ServerValue.TIMESTAMP
+        });
+    }
 
-    // Geohash-based Search (Free Tier)
-    findNearbyUsersGeohash: findNearbyUsersWithGeohash,
-    findSameCollegeNearby: findSameCollegeNearby,
-    updateUserGeohash: updateUserGeohash,
+    // Set user offline — call on logout
+    function setUserOffline(email) {
+        if (!firebaseRealtimeDB || !email) return;
+        const key = sanitizeEmailForPath(email);
+        firebaseRealtimeDB.ref(`presence/${key}`).set({
+            online: false,
+            lastSeen: firebase.database.ServerValue.TIMESTAMP
+        });
+    }
 
-    // Cloud Functions - Optimized Search (Blaze plan)
-    findNearbyCompanions: findNearbyCompanionsCloud,
-    findCompanionsProgressive: findCompanionsProgressiveCloud,
+    // Listen to another user's presence
+    function listenToPresence(email, callback) {
+        if (!firebaseRealtimeDB || !email) return () => { };
+        const key = sanitizeEmailForPath(email);
+        const ref = firebaseRealtimeDB.ref(`presence/${key}`);
+        ref.on('value', snap => {
+            const val = snap.val() || { online: false, lastSeen: null };
+            callback(val);
+        });
+        return () => ref.off('value');
+    }
 
-    // Realtime DB (Messaging)
-    getChatKey: getFirebaseChatKey,
-    sendMessage: sendFirebaseMessage,
-    listenToMessages,
-    getMessages,
-    listenToUserChatIndex,
-    clearUnreadInIndex,
+    // ============ Typing Indicator ============
 
-    // Presence
-    setUserOnline,
-    setUserOffline,
-    listenToPresence,
+    function setTyping(chatKey, email, isTyping) {
+        if (!firebaseRealtimeDB || !chatKey || !email) return;
+        const key = sanitizeEmailForPath(email);
+        const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/typing/${key}`);
+        if (isTyping) {
+            ref.set(true);
+            ref.onDisconnect().remove();
+        } else {
+            ref.remove();
+        }
+    }
 
-    // Typing
-    setTyping,
-    listenToTyping,
+    function listenToTyping(chatKey, excludeEmail, callback) {
+        if (!firebaseRealtimeDB || !chatKey) return () => { };
+        const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/typing`);
+        const myKey = sanitizeEmailForPath(excludeEmail);
+        ref.on('value', snap => {
+            const val = snap.val() || {};
+            // Remove own typing
+            delete val[myKey];
+            const isTyping = Object.keys(val).length > 0;
+            callback(isTyping);
+        });
+        return () => ref.off('value');
+    }
 
-    // Message Status
-    updateMessageStatus,
-    markMessagesAsRead,
+    // ============ Message Status (Ticks) ============
 
-    // Reactions
-    toggleReaction,
+    // Update a single message status
+    async function updateMessageStatus(chatKey, msgId, status) {
+        if (!firebaseRealtimeDB) return;
+        try {
+            await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}/status`).set(status);
+        } catch (e) {
+            console.error('Update message status error:', e);
+        }
+    }
 
-    // Delete
-    deleteMessage,
+    // Mark all messages from other user as read
+    async function markMessagesAsRead(chatKey, readerEmail) {
+        if (!firebaseRealtimeDB) return;
+        try {
+            const snap = await firebaseRealtimeDB.ref(`chats/${chatKey}/messages`).once('value');
+            const updates = {};
+            snap.forEach(child => {
+                const msg = child.val();
+                if (msg.from !== readerEmail && msg.status !== 'read') {
+                    updates[`${child.key}/status`] = 'read';
+                }
+            });
+            if (Object.keys(updates).length > 0) {
+                await firebaseRealtimeDB.ref(`chats/${chatKey}/messages`).update(updates);
+            }
+        } catch (e) {
+            console.error('Mark messages as read error:', e);
+        }
+    }
 
-    // Group Chat
-    createGroup,
-    getGroupsForUser,
-    findMatchingGroups,
-    joinGroup,
-    leaveGroup,
-    listenToGroupMessages,
-    sendGroupMessage,
-    listenToAllUserChats: () => { }, // deprecated — kept for safety
-    backfillUserChatIndex
+    // ============ Reactions ============
+
+    async function toggleReaction(chatKey, msgId, emoji, email) {
+        if (!firebaseRealtimeDB) return;
+        try {
+            const ref = firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}/reactions/${emoji}`);
+            const snap = await ref.once('value');
+            const users = snap.val() || [];
+            const idx = users.indexOf(email);
+            if (idx > -1) {
+                users.splice(idx, 1);
+            } else {
+                users.push(email);
+            }
+            if (users.length === 0) {
+                await ref.remove();
+            } else {
+                await ref.set(users);
+            }
+            return { success: true };
+        } catch (e) {
+            console.error('Toggle reaction error:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    // ============ Delete / Unsend ============
+
+    async function deleteMessage(chatKey, msgId, email) {
+        if (!firebaseRealtimeDB) return { success: false };
+        try {
+            // Only allow sender to delete their own message
+            const snap = await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}`).once('value');
+            const msg = snap.val();
+            if (!msg || msg.from !== email) {
+                return { success: false, error: 'Unauthorized' };
+            }
+            await firebaseRealtimeDB.ref(`chats/${chatKey}/messages/${msgId}`).update({
+                deleted: true,
+                text: ''
+            });
+            return { success: true };
+        } catch (e) {
+            console.error('Delete message error:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    // ============ Group Chat ============
+
+    async function createGroup(groupData) {
+        if (!firebaseRealtimeDB) return { success: false };
+        try {
+            const groupRef = firebaseRealtimeDB.ref('groups').push();
+            const groupId = groupRef.key;
+            await groupRef.set({
+                ...groupData,
+                id: groupId,
+                createdAt: firebase.database.ServerValue.TIMESTAMP
+            });
+            return { success: true, groupId };
+        } catch (e) {
+            console.error('Create group error:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    async function getGroupsForUser(email) {
+        if (!firebaseRealtimeDB || !email || typeof email !== 'string' || !email.trim()) {
+            return { success: false, data: [] };
+        }
+        try {
+            // Race against a 10-second timeout to prevent hanging on slow connections
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('getGroupsForUser timed out')), 10000)
+            );
+            const snap = await Promise.race([
+                firebaseRealtimeDB.ref('groups').once('value'),
+                timeoutPromise
+            ]);
+            const groups = [];
+            const key = sanitizeEmailForPath(email);
+            snap.forEach(child => {
+                const g = child.val();
+                if (g && g.members && g.members[key]) {
+                    groups.push({ ...g, id: child.key });
+                }
+            });
+            return { success: true, data: groups };
+        } catch (e) {
+            console.error('Get groups error:', e);
+            return { success: false, data: [] };
+        }
+    }
+
+    async function findMatchingGroups(college, destinationGeohash) {
+        if (!firebaseRealtimeDB) return { success: false, data: [] };
+        // If neither filter is provided, return early — nothing to match against
+        if ((!college || !college.trim()) && (!destinationGeohash || !destinationGeohash.trim())) {
+            return { success: true, data: [] };
+        }
+        try {
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('findMatchingGroups timed out')), 10000)
+            );
+            const snap = await Promise.race([
+                firebaseRealtimeDB.ref('groups').once('value'),
+                timeoutPromise
+            ]);
+            const groups = [];
+            const prefix = destinationGeohash ? destinationGeohash.substring(0, 4) : '';
+            const collegeLower = college ? college.toLowerCase() : '';
+            snap.forEach(child => {
+                const g = child.val();
+                if (!g) return;
+                const matchCollege = collegeLower && g.college && g.college.toLowerCase() === collegeLower;
+                const matchDest = prefix && g.destinationGeohash && g.destinationGeohash.startsWith(prefix);
+                if (matchCollege || matchDest) {
+                    groups.push({ ...g, id: child.key });
+                }
+            });
+            return { success: true, data: groups };
+        } catch (e) {
+            console.error('Find matching groups error:', e);
+            return { success: false, data: [] };
+        }
+    }
+
+    async function joinGroup(groupId, email) {
+        if (!firebaseRealtimeDB) return { success: false };
+        try {
+            const key = sanitizeEmailForPath(email);
+            await firebaseRealtimeDB.ref(`groups/${groupId}/members/${key}`).set(true);
+            return { success: true };
+        } catch (e) {
+            console.error('Join group error:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    async function leaveGroup(groupId, email) {
+        if (!firebaseRealtimeDB) return { success: false };
+        try {
+            const key = sanitizeEmailForPath(email);
+            await firebaseRealtimeDB.ref(`groups/${groupId}/members/${key}`).remove();
+            return { success: true };
+        } catch (e) {
+            console.error('Leave group error:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    function listenToGroupMessages(groupId, callback) {
+        if (!firebaseRealtimeDB) return () => { };
+        const ref = firebaseRealtimeDB.ref(`chats/group_${groupId}/messages`);
+        ref.on('value', snap => {
+            const messages = [];
+            snap.forEach(child => {
+                messages.push({ id: child.key, ...child.val() });
+            });
+            callback(messages);
+        });
+        return () => ref.off('value');
+    }
+
+    async function sendGroupMessage(groupId, message) {
+        if (!firebaseRealtimeDB) return { success: false };
+        try {
+            await firebaseRealtimeDB.ref(`chats/group_${groupId}/messages`).push(message);
+            return { success: true };
+        } catch (e) {
+            console.error('Send group message error:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    // ============ Utility: Check if Firebase is available ============
+    function isFirebaseAvailable() {
+        return firebaseApp !== null && firebaseAuth !== null && firebaseDB !== null;
+    }
+
+    // ============ Cloud Functions Helpers ============
+
+    // Initialize Firebase Functions (for region-specific calls)
+    let firebaseFunctions = null;
+
+    function initializeFunctions() {
+        if (typeof firebase !== 'undefined' && firebase.functions) {
+            // Use asia-south1 region (same as Cloud Function)
+            firebaseFunctions = firebase.app().functions('asia-south1');
+            console.log('⚡ Firebase Functions initialized (asia-south1)');
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Find nearby companions using Cloud Function
+     * This is much faster than fetching all users client-side
+     * 
+     * @param {number} latitude - Search center latitude
+     * @param {number} longitude - Search center longitude
+     * @param {string} collegeName - User's college name for filtering
+     * @param {string} currentUserEmail - Email of current user to exclude
+     * @param {number} radiusKm - Search radius in kilometers (default: 100)
+     * @returns {Promise<Object>} - Result with companions array
+     */
+    async function findNearbyCompanionsCloud(latitude, longitude, collegeName, currentUserEmail, radiusKm = 100) {
+        try {
+            // Initialize functions if not already
+            if (!firebaseFunctions) {
+                initializeFunctions();
+            }
+
+            if (!firebaseFunctions) {
+                console.warn('⚠️ Cloud Functions not available, falling back to local search');
+                return { success: false, error: 'Cloud Functions not initialized' };
+            }
+
+            console.log(`☁️ Calling Cloud Function: findNearbyCompanions`);
+            console.log(`   📍 Coordinates: (${latitude}, ${longitude})`);
+            console.log(`   🏫 College: ${collegeName}`);
+            console.log(`   📏 Radius: ${radiusKm}km`);
+
+            const findNearbyCompanions = firebaseFunctions.httpsCallable('findNearbyCompanions');
+
+            const result = await findNearbyCompanions({
+                latitude,
+                longitude,
+                collegeName,
+                currentUserEmail,
+                radiusKm,
+                maxResults: 50
+            });
+
+            console.log(`✅ Cloud Function returned ${result.data.count} companions`);
+            return { success: true, data: result.data };
+
+        } catch (error) {
+            console.error('❌ Cloud Function error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
+     * Progressive companion search - expands radius until enough results found
+     */
+    async function findCompanionsProgressiveCloud(latitude, longitude, collegeName, currentUserEmail) {
+        try {
+            if (!firebaseFunctions) {
+                initializeFunctions();
+            }
+
+            if (!firebaseFunctions) {
+                return { success: false, error: 'Cloud Functions not initialized' };
+            }
+
+            const findCompanionsProgressive = firebaseFunctions.httpsCallable('findCompanionsProgressive');
+
+            const result = await findCompanionsProgressive({
+                latitude,
+                longitude,
+                collegeName,
+                currentUserEmail,
+                minResults: 10,
+                maxRadius: 200
+            });
+
+            return { success: true, data: result.data };
+
+        } catch (error) {
+            console.error('❌ Progressive search error:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Export for use in app.js (global scope for non-module usage)
+    window.FirebaseService = {
+        init: initializeFirebase,
+        isAvailable: isFirebaseAvailable,
+        initFunctions: initializeFunctions,
+
+        // Auth
+        signUp: firebaseSignUp,
+        signIn: firebaseSignIn,
+        signOut: firebaseSignOut,
+        getCurrentUser,
+        onAuthStateChange,
+
+        // Firestore
+        saveUserProfile,
+        getUserProfile,
+        getUserByEmail: getUserByEmailFromFirestore,
+        updateUserProfile,
+        getAllUsers,
+        getUsersByCollege,
+
+        // Geohash-based Search (Free Tier)
+        findNearbyUsersGeohash: findNearbyUsersWithGeohash,
+        findSameCollegeNearby: findSameCollegeNearby,
+        updateUserGeohash: updateUserGeohash,
+
+        // Cloud Functions - Optimized Search (Blaze plan)
+        findNearbyCompanions: findNearbyCompanionsCloud,
+        findCompanionsProgressive: findCompanionsProgressiveCloud,
+
+        // Realtime DB (Messaging)
+        getChatKey: getFirebaseChatKey,
+        sendMessage: sendFirebaseMessage,
+        listenToMessages,
+        getMessages,
+        listenToUserChatIndex,
+        clearUnreadInIndex,
+
+        // Presence
+        setUserOnline,
+        setUserOffline,
+        listenToPresence,
+
+        // Typing
+        setTyping,
+        listenToTyping,
+
+        // Message Status
+        updateMessageStatus,
+        markMessagesAsRead,
+
+        // Reactions
+        toggleReaction,
+
+        // Delete
+        deleteMessage,
+
+        // Group Chat
+        createGroup,
+        getGroupsForUser,
+        findMatchingGroups,
+        joinGroup,
+        leaveGroup,
+        listenToGroupMessages,
+        sendGroupMessage,
+        listenToAllUserChats: () => { }, // deprecated — kept for safety
+        backfillUserChatIndex,
+        getOlderMessages
+    };
 };
-

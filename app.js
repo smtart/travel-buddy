@@ -3029,26 +3029,11 @@ const MessagingState = {
     unsubscribeAllChats: null
 };
 
-// Initialize Pusher
+// Pusher is no longer used — Firebase Realtime Database handles all messaging.
+// Keeping stub to avoid any undefined reference errors.
 function initPusher() {
-    if (typeof Pusher === 'undefined') {
-        console.error('Pusher not loaded');
-        return;
-    }
-
-    MessagingState.pusher = new Pusher(PUSHER_CONFIG.key, {
-        cluster: PUSHER_CONFIG.cluster,
-        forceTLS: true
-    });
-
-    if (AppState.userData) {
-        const channelName = `chat-${AppState.userData.email.replace(/[^a-z0-9]/gi, '-')}`;
-        MessagingState.channel = MessagingState.pusher.subscribe(channelName);
-
-        MessagingState.channel.bind('new-message', function (data) {
-            handleIncomingMessage(data);
-        });
-    }
+    // Disabled: Firebase replaced Pusher for real-time messaging
+    console.log('ℹ️ Pusher disabled — Firebase handles real-time messaging');
 }
 
 // Handle incoming messages
@@ -3130,12 +3115,69 @@ function updateNavBadge() {
 }
 
 // ============ Messages Storage ============
+// Trims each chat to last 50 messages before saving (localStorage 5MB guard)
 function saveMessagesToStorage() {
-    saveToLocalStorage('travelBuddyMessages', MessagingState.messages);
+    const trimmed = {};
+    for (const [key, msgs] of Object.entries(MessagingState.messages)) {
+        // Only store last 50 per chat key to prevent localStorage overflow
+        trimmed[key] = Array.isArray(msgs) ? msgs.slice(-50) : msgs;
+    }
+    saveToLocalStorage('travelBuddyMessages', trimmed);
 }
 
 function loadMessagesFromStorage() {
     MessagingState.messages = getFromLocalStorage('travelBuddyMessages') || {};
+}
+
+// ============ Load Older Messages (pagination) ============
+// Called by the "↑ Load older messages" button at the top of the chat view
+async function loadOlderMessages() {
+    if (!MessagingState.currentChatUser || !AppState.useFirebase) return;
+
+    const chatKey = getChatKey(MessagingState.currentChatUser.email);
+    const currentMsgs = MessagingState.messages[chatKey] || [];
+    if (currentMsgs.length === 0) return;
+
+    // The oldest message we currently have
+    const oldestMsg = currentMsgs[0];
+    if (!oldestMsg?.id) return;
+
+    const btn = document.getElementById('loadOlderMsgsBtn');
+    if (btn) btn.innerHTML = '<span style="color:#aaa; font-size:13px;">Loading...</span>';
+
+    const result = await FirebaseService.getOlderMessages(chatKey, oldestMsg.id, 50);
+    if (!result.success || result.data.length === 0) {
+        if (btn) btn.style.display = 'none'; // No more history
+        return;
+    }
+
+    // Prepend older messages to the current list
+    const olderMsgs = result.data.map(msg => ({
+        ...msg,
+        type: msg.from === AppState.userData.email ? 'sent' : 'received'
+    }));
+
+    MessagingState.messages[chatKey] = [...olderMsgs, ...currentMsgs];
+
+    // Re-render and restore scroll position to where user was
+    const chatMessages = document.getElementById('chatMessages');
+    const prevHeight = chatMessages?.scrollHeight || 0;
+
+    renderChatMessages();
+
+    // Restore scroll so user stays at same position
+    if (chatMessages) {
+        chatMessages.scrollTop = chatMessages.scrollHeight - prevHeight;
+    }
+
+    // Restore button or hide if less than 50 came back (means no more history)
+    if (btn) {
+        if (result.data.length < 50) {
+            btn.style.display = 'none';
+        } else {
+            btn.innerHTML = '<button onclick="loadOlderMessages()" style="background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#aaa; border-radius:20px; padding:6px 16px; cursor:pointer; font-size:13px;">↑ Load older messages</button>';
+        }
+    }
 }
 
 // ============ Setup Messaging ============
@@ -3217,11 +3259,16 @@ function setupMessaging() {
             }
         );
 
-        // ── Firebase connection management: go offline when tab is hidden ──
-        // Saves Firebase billing by pausing all realtime listeners while user is in another tab
+        // ── Firebase connection management: go offline only when messaging section is hidden ──
+        // Scoped to messaging section — not all tab switches — to avoid affecting map/groups
         document.addEventListener('visibilitychange', () => {
             if (AppState.useFirebase && window.firebase && firebase.database) {
-                if (document.hidden) {
+                const messagesSection = document.getElementById('messagesSection');
+                const isMessagingVisible = messagesSection &&
+                    messagesSection.style.display !== 'none' &&
+                    !document.hidden;
+
+                if (document.hidden || !isMessagingVisible) {
                     firebase.database().goOffline();
                 } else {
                     firebase.database().goOnline();
