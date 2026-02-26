@@ -125,7 +125,7 @@ function getFromLocalStorage(key) {
 // ============ Cached Firebase Fetch ============
 // Cache-first strategy: fetch from localStorage first, hit Firebase only if cache is stale.
 // TTL = 5 minutes. Cuts Firebase reads from ~4/session to ~1-2.
-const USERS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const USERS_CACHE_TTL = 10 * 60 * 1000; // 10 minutes (extended for high-traffic optimization)
 
 async function cachedFetchUsers(scope = 'college') {
     const currentUser = AppState.userData;
