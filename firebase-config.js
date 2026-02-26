@@ -633,9 +633,12 @@ async function sendFirebaseMessage(chatKey, message) {
     }
 }
 
-// Listen to messages
+// Listen to messages — loads only last 50 to reduce data download
 function listenToMessages(chatKey, callback) {
-    const messagesRef = firebaseRealtimeDB.ref(`chats/${chatKey}/messages`);
+    // limitToLast(50) — only fetch the most recent 50 messages, not full history
+    const messagesRef = firebaseRealtimeDB
+        .ref(`chats/${chatKey}/messages`)
+        .limitToLast(50);
 
     messagesRef.on('value', (snapshot) => {
         const messages = [];

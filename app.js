@@ -3165,8 +3165,12 @@ function setupMessaging() {
     if (AppState.useFirebase && window.FirebaseService && AppState.userData) {
         FirebaseService.setUserOnline(AppState.userData.email);
 
-        // Backfill index for existing chats (runs once — seeds user_chats for old conversations)
-        FirebaseService.backfillUserChatIndex(AppState.userData.email);
+        // Backfill index for existing chats — runs ONCE per device (localStorage guard)
+        if (!localStorage.getItem('tbChatIndexBackfilled')) {
+            FirebaseService.backfillUserChatIndex(AppState.userData.email).then(() => {
+                localStorage.setItem('tbChatIndexBackfilled', '1');
+            });
+        }
 
         // ── Efficient user-chat index listener ──
         // Reads only user_chats/{myKey} (tiny index node) — not the full /chats tree
@@ -3212,6 +3216,18 @@ function setupMessaging() {
                 }
             }
         );
+
+        // ── Firebase connection management: go offline when tab is hidden ──
+        // Saves Firebase billing by pausing all realtime listeners while user is in another tab
+        document.addEventListener('visibilitychange', () => {
+            if (AppState.useFirebase && window.firebase && firebase.database) {
+                if (document.hidden) {
+                    firebase.database().goOffline();
+                } else {
+                    firebase.database().goOnline();
+                }
+            }
+        });
     }
 
     // Bubble tabs
@@ -3345,6 +3361,7 @@ async function loadUsersList(searchQuery = '') {
     usersList.innerHTML = '<div class="loading-users"><i class="fas fa-spinner fa-spin"></i><span>Loading users...</span></div>';
 
     // Fetch users (cache-first — avoids Firebase on every tab switch)
+    // Cache TTL: 10 minutes to minimize Firestore reads under high traffic
     const scope = MessagingState.currentFilter === 'myCollege' ? 'college' : 'all';
     let users = await cachedFetchUsers(scope);
 
