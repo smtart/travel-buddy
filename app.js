@@ -482,7 +482,7 @@ async function handleLogin(e) {
             const authResult = await FirebaseService.signIn(email, password);
 
             if (!authResult.success) {
-                showToast(authResult.error || 'Login failed', 'error');
+                showToast('Invalid email or password. Please try again.', 'error');
                 return;
             }
 
@@ -520,7 +520,7 @@ async function handleLogin(e) {
 
         } catch (error) {
             console.error('Firebase login error:', error);
-            showToast('Login error: ' + error.message, 'error');
+            showToast('Invalid email or password. Please try again.', 'error');
         }
     } else {
         // Fallback to localStorage
@@ -3170,11 +3170,15 @@ function setupMessaging() {
         });
     });
 
-    // Search users (debounced — avoids re-rendering on every keystroke)
+    // Search users/groups (debounced — avoids re-rendering on every keystroke)
     userSearchInput.addEventListener('input', (e) => {
         clearTimeout(MessagingState.searchDebounceTimer);
         MessagingState.searchDebounceTimer = setTimeout(() => {
-            loadUsersList(e.target.value);
+            if (MessagingState.currentFilter === 'groups') {
+                loadGroupsList(e.target.value);
+            } else {
+                loadUsersList(e.target.value);
+            }
         }, 300);
     });
 
@@ -3979,7 +3983,7 @@ async function handleDelete(msgId) {
 // ==========================================
 
 // Load groups list (when "Groups" tab is active)
-async function loadGroupsList() {
+async function loadGroupsList(searchQuery = '') {
     const usersList = document.getElementById('usersList');
     const currentUser = AppState.userData;
 
@@ -3991,25 +3995,42 @@ async function loadGroupsList() {
     usersList.innerHTML = '<div class="loading-users"><i class="fas fa-spinner fa-spin"></i><span>Loading groups...</span></div>';
 
     try {
-        // Fetch existing groups
-        const result = await FirebaseService.getGroupsForUser(currentUser.email);
-        const groups = result.success ? result.data : [];
+        // Fetch user's joined groups and available groups in parallel
+        const myKey = sanitizeEmailForPresence(currentUser.email);
 
-        // Fetch all users to find same-route travelers
-        const usersResult = await FirebaseService.getAllUsers();
-        const allUsers = usersResult.success ? usersResult.data : [];
+        const [myGroupsResult, matchingResult] = await Promise.all([
+            FirebaseService.getGroupsForUser(currentUser.email).catch(e => {
+                console.error('Fetch my groups failed:', e);
+                return { success: false, data: [] };
+            }),
+            FirebaseService.findMatchingGroups(
+                currentUser.collegeName || '',
+                currentUser.destinationGeohash || ''
+            ).catch(e => {
+                console.error('Fetch matching groups failed:', e);
+                return { success: false, data: [] };
+            })
+        ]);
 
-        // Find same-route travelers (same college OR similar destination)
-        const myGeo = currentUser.destinationGeohash || '';
-        const myGeoPrefix = myGeo.substring(0, 4);
-        const myCollege = (currentUser.collegeName || '').toLowerCase();
+        const myGroups = myGroupsResult.success ? myGroupsResult.data : [];
+        const myGroupIds = new Set(myGroups.map(g => g.id));
 
-        const routeCompanions = allUsers.filter(u => {
-            if (u.email === currentUser.email) return false;
-            const sameCollege = myCollege && (u.collegeName || '').toLowerCase() === myCollege;
-            const similarDest = myGeoPrefix && u.destinationGeohash && u.destinationGeohash.startsWith(myGeoPrefix);
-            return sameCollege || similarDest;
-        });
+        // Available groups = matching groups the user hasn't joined yet
+        const availableGroups = (matchingResult.success ? matchingResult.data : [])
+            .filter(g => !myGroupIds.has(g.id));
+
+        // Apply search filter if query is provided
+        const query = searchQuery.trim().toLowerCase();
+        const filterGroup = (g) => {
+            if (!query) return true;
+            const name = (g.name || '').toLowerCase();
+            const dest = (g.destinationName || '').toLowerCase();
+            const college = (g.college || '').toLowerCase();
+            return name.includes(query) || dest.includes(query) || college.includes(query);
+        };
+
+        const filteredMyGroups = myGroups.filter(filterGroup);
+        const filteredAvailable = availableGroups.filter(filterGroup);
 
         let html = '';
 
@@ -4021,9 +4042,10 @@ async function loadGroupsList() {
             </div>
         `;
 
-        // Existing groups
-        if (groups.length > 0) {
-            html += groups.map(group => {
+        // ── My Groups section ──
+        if (filteredMyGroups.length > 0) {
+            html += `<div class="group-section-label"><i class="fas fa-check-circle"></i> My Groups</div>`;
+            html += filteredMyGroups.map(group => {
                 const memberCount = group.members ? Object.keys(group.members).length : 0;
                 return `
                     <div class="group-item" data-group-id="${group.id}">
@@ -4036,57 +4058,39 @@ async function loadGroupsList() {
                     </div>
                 `;
             }).join('');
-        }
-
-        // Route companions section
-        if (routeCompanions.length > 0) {
+        } else if (!query) {
             html += `
-                <div style="padding:10px 4px 6px;font-size:0.78rem;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">
-                    <i class="fas fa-route" style="margin-right:4px;"></i> Same Route Travelers (${routeCompanions.length})
+                <div class="no-users-message" style="padding:16px 12px;">
+                    <i class="fas fa-users-slash" style="font-size:1.2rem;"></i>
+                    <p style="margin:4px 0 0;">You haven't joined any groups yet.</p>
                 </div>
             `;
-            html += routeCompanions.map(user => {
-                const sameCollege = myCollege && (user.collegeName || '').toLowerCase() === myCollege;
-                const similarDest = myGeoPrefix && user.destinationGeohash && user.destinationGeohash.startsWith(myGeoPrefix);
-                let tags = [];
-                if (sameCollege) tags.push('🏫 Same College');
-                if (similarDest) tags.push('📍 Same Route');
+        }
+
+        // ── Available Groups section ──
+        if (filteredAvailable.length > 0) {
+            html += `<div class="group-section-label" style="margin-top:12px;"><i class="fas fa-compass"></i> Available Groups</div>`;
+            html += filteredAvailable.map(group => {
+                const memberCount = group.members ? Object.keys(group.members).length : 0;
                 return `
-                    <div class="user-item" data-email="${user.email}">
-                        <div class="user-item-avatar">
-                            <img src="${user.profilePic || 'https://via.placeholder.com/50'}" alt="${user.fullName}" class="user-avatar-img" data-email="${user.email}">
+                    <div class="group-item group-available" data-available-group-id="${group.id}">
+                        <div class="group-avatar">🚌</div>
+                        <div class="group-item-info">
+                            <h4>${escapeHtml(group.name || 'Travel Group')}</h4>
+                            <p><i class="fas fa-map-marker-alt"></i> ${escapeHtml(group.destinationName || 'N/A')}</p>
                         </div>
-                        <div class="user-item-info">
-                            <h4>${user.fullName}</h4>
-                            <p style="font-size:0.72rem;color:var(--brand-light);">${tags.join(' • ')}</p>
-                        </div>
-                        <div class="user-item-meta">
-                            <span style="font-size:0.7rem;color:var(--text-muted);">${user.destinationName || ''}</span>
-                        </div>
+                        <button class="group-suggestion-btn join-available-btn" data-join-id="${group.id}" style="padding:5px 14px;font-size:0.75rem;">Join</button>
                     </div>
                 `;
             }).join('');
-
-            // Auto-create group suggestion
-            if (groups.length === 0 && routeCompanions.length >= 2) {
-                html += `
-                    <div class="group-suggestion-banner" id="autoCreateGroupBanner" style="margin-top:8px;">
-                        <i class="fas fa-magic"></i>
-                        <div class="group-suggestion-info">
-                            <h4>Create a group with ${routeCompanions.length} travelers?</h4>
-                            <p>${currentUser.collegeName || 'Your college'} → ${currentUser.destinationName || 'destination'}</p>
-                        </div>
-                        <button class="group-suggestion-btn" id="autoCreateGroupBtn">Create</button>
-                    </div>
-                `;
-            }
         }
 
-        if (groups.length === 0 && routeCompanions.length === 0) {
+        // No results message when searching
+        if (query && filteredMyGroups.length === 0 && filteredAvailable.length === 0) {
             html += `
-                <div class="no-users-message">
-                    <i class="fas fa-users-slash"></i>
-                    <p>No groups or route matches yet</p>
+                <div class="no-users-message" style="padding:16px 12px;">
+                    <i class="fas fa-search" style="font-size:1.2rem;"></i>
+                    <p style="margin:4px 0 0;">No groups matching "${escapeHtml(searchQuery.trim())}"</p>
                 </div>
             `;
         }
@@ -4096,49 +4100,36 @@ async function loadGroupsList() {
         // Create group handler
         document.getElementById('createGroupItem')?.addEventListener('click', openCreateGroupModal);
 
-        // Auto-create group handler
-        document.getElementById('autoCreateGroupBtn')?.addEventListener('click', async () => {
-            const name = `${currentUser.collegeName || 'College'} → ${currentUser.destinationName || 'Destination'}`;
-            const myKey = sanitizeEmailForPresence(currentUser.email);
-            const members = { [myKey]: true };
-            // Add route companions to the group
-            routeCompanions.forEach(u => {
-                members[sanitizeEmailForPresence(u.email)] = true;
-            });
-            const groupData = {
-                name,
-                college: currentUser.collegeName || '',
-                destinationName: currentUser.destinationName || '',
-                destinationGeohash: currentUser.destinationGeohash || '',
-                createdBy: currentUser.email,
-                members
-            };
-            const res = await FirebaseService.createGroup(groupData);
-            if (res.success) {
-                showToast(`Group created with ${routeCompanions.length + 1} members!`, 'success');
-                loadGroupsList();
-            }
-        });
-
-        // Group click handlers
+        // My group click handlers — open chat
         usersList.querySelectorAll('.group-item[data-group-id]').forEach(item => {
             item.addEventListener('click', () => {
-                const group = groups.find(g => g.id === item.dataset.groupId);
+                const group = filteredMyGroups.find(g => g.id === item.dataset.groupId);
                 if (group) openGroupChat(group);
             });
         });
 
-        // User click handlers (open 1:1 chat)
-        usersList.querySelectorAll('.user-item[data-email]').forEach(item => {
-            item.addEventListener('click', () => {
-                const user = routeCompanions.find(u => u.email === item.dataset.email);
-                if (user) openChat(user);
+        // Available group Join handlers
+        usersList.querySelectorAll('.join-available-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const groupId = btn.dataset.joinId;
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+                const res = await FirebaseService.joinGroup(groupId, currentUser.email);
+                if (res.success) {
+                    showToast('Joined group!', 'success');
+                    loadGroupsList(); // Refresh to move it to My Groups
+                } else {
+                    showToast('Failed to join group', 'error');
+                    btn.disabled = false;
+                    btn.textContent = 'Join';
+                }
             });
         });
 
     } catch (e) {
         console.error('Load groups error:', e);
-        usersList.innerHTML = '<div class="no-users-message"><p>Error loading groups</p></div>';
+        usersList.innerHTML = '<div class="no-users-message"><p>Error loading groups. Please try again.</p></div>';
     }
 }
 
@@ -4153,8 +4144,16 @@ async function loadGroupSuggestions() {
         return;
     }
 
-    // Track groups the user has joined this session (prevents banner flicker)
-    if (!MessagingState.joinedGroupIds) MessagingState.joinedGroupIds = new Set();
+    // If user is already a member of ANY group, hide the banner entirely
+    try {
+        const myGroups = await FirebaseService.getGroupsForUser(user.email);
+        if (myGroups.success && myGroups.data.length > 0) {
+            area.innerHTML = '';
+            return;
+        }
+    } catch (e) {
+        console.error('Group membership check error:', e);
+    }
 
     try {
         const result = await FirebaseService.findMatchingGroups(user.collegeName, user.destinationGeohash);
@@ -4163,15 +4162,9 @@ async function loadGroupSuggestions() {
             return;
         }
 
-        // Filter out groups user is already in (Firebase data) AND locally joined groups
+        // Filter out groups user is already in
         const myKey = sanitizeEmailForPresence(user.email);
-        const suggestions = result.data.filter(g => {
-            // Skip if user already a member in Firebase data
-            if (g.members && g.members[myKey]) return false;
-            // Skip if user joined this session (local tracking)
-            if (MessagingState.joinedGroupIds.has(g.id)) return false;
-            return true;
-        });
+        const suggestions = result.data.filter(g => !g.members || !g.members[myKey]);
 
         if (suggestions.length === 0) {
             area.innerHTML = '';
@@ -4197,8 +4190,6 @@ async function loadGroupSuggestions() {
             e.stopPropagation();
             const res = await FirebaseService.joinGroup(group.id, user.email);
             if (res.success) {
-                // Track locally so banner won't reappear
-                MessagingState.joinedGroupIds.add(group.id);
                 showToast('Joined group!', 'success');
                 area.innerHTML = '';
                 // If on groups tab, refresh

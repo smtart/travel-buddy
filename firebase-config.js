@@ -812,13 +812,23 @@ async function createGroup(groupData) {
 }
 
 async function getGroupsForUser(email) {
-    if (!firebaseRealtimeDB || !email) return { success: false, data: [] };
+    if (!firebaseRealtimeDB || !email || typeof email !== 'string' || !email.trim()) {
+        return { success: false, data: [] };
+    }
     try {
-        const snap = await firebaseRealtimeDB.ref('groups').once('value');
+        // Race against a 10-second timeout to prevent hanging on slow connections
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('getGroupsForUser timed out')), 10000)
+        );
+        const snap = await Promise.race([
+            firebaseRealtimeDB.ref('groups').once('value'),
+            timeoutPromise
+        ]);
         const groups = [];
+        const key = sanitizeEmailForPath(email);
         snap.forEach(child => {
             const g = child.val();
-            if (g.members && g.members[sanitizeEmailForPath(email)]) {
+            if (g && g.members && g.members[key]) {
                 groups.push({ ...g, id: child.key });
             }
         });
@@ -831,13 +841,25 @@ async function getGroupsForUser(email) {
 
 async function findMatchingGroups(college, destinationGeohash) {
     if (!firebaseRealtimeDB) return { success: false, data: [] };
+    // If neither filter is provided, return early — nothing to match against
+    if ((!college || !college.trim()) && (!destinationGeohash || !destinationGeohash.trim())) {
+        return { success: true, data: [] };
+    }
     try {
-        const snap = await firebaseRealtimeDB.ref('groups').once('value');
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('findMatchingGroups timed out')), 10000)
+        );
+        const snap = await Promise.race([
+            firebaseRealtimeDB.ref('groups').once('value'),
+            timeoutPromise
+        ]);
         const groups = [];
         const prefix = destinationGeohash ? destinationGeohash.substring(0, 4) : '';
+        const collegeLower = college ? college.toLowerCase() : '';
         snap.forEach(child => {
             const g = child.val();
-            const matchCollege = g.college && college && g.college.toLowerCase() === college.toLowerCase();
+            if (!g) return;
+            const matchCollege = collegeLower && g.college && g.college.toLowerCase() === collegeLower;
             const matchDest = prefix && g.destinationGeohash && g.destinationGeohash.startsWith(prefix);
             if (matchCollege || matchDest) {
                 groups.push({ ...g, id: child.key });

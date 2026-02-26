@@ -2306,6 +2306,17 @@ textarea {
 .message-swipe-wrapper {
     position: relative;
     overflow: visible;
+    display: flex;
+}
+
+/* Sent messages: push wrapper to the right */
+.message-swipe-wrapper:has(> .message.sent) {
+    justify-content: flex-end;
+}
+
+/* Received messages: push wrapper to the left */
+.message-swipe-wrapper:has(> .message.received) {
+    justify-content: flex-start;
 }
 
 .swipe-reply-icon {
@@ -2406,6 +2417,32 @@ textarea {
 }
 
 /* ─── Group Chat ─── */
+.group-section-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: var(--sp-2) var(--sp-1);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.group-section-label i {
+    color: var(--brand-light);
+    font-size: 0.7rem;
+}
+
+.group-available {
+    border-style: dashed;
+    opacity: 0.85;
+}
+
+.group-available:hover {
+    opacity: 1;
+}
+
 .group-item {
     display: flex;
     align-items: center;
