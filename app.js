@@ -122,6 +122,55 @@ function getFromLocalStorage(key) {
     return data ? JSON.parse(data) : null;
 }
 
+// ============ Cached Firebase Fetch ============
+// Cache-first strategy: fetch from localStorage first, hit Firebase only if cache is stale.
+// TTL = 5 minutes. Cuts Firebase reads from ~4/session to ~1-2.
+const USERS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function cachedFetchUsers(scope = 'college') {
+    const currentUser = AppState.userData;
+    if (!currentUser) return [];
+
+    const cacheKey = scope === 'college'
+        ? `tb_cache_college_${(currentUser.collegeName || '').toLowerCase()}`
+        : 'tb_cache_all';
+
+    // 1. Check cache
+    const cached = getFromLocalStorage(cacheKey);
+    if (cached && cached.ts && (Date.now() - cached.ts < USERS_CACHE_TTL)) {
+        console.log(`📦 Using cached users (${scope}), age: ${Math.round((Date.now() - cached.ts) / 1000)}s`);
+        return cached.data;
+    }
+
+    // 2. Fetch from Firebase
+    if (AppState.useFirebase && window.FirebaseService) {
+        try {
+            const result = scope === 'college'
+                ? await FirebaseService.getUsersByCollege(currentUser.collegeName)
+                : await FirebaseService.getAllUsers();
+            if (result.success) {
+                // Save to cache with timestamp
+                saveToLocalStorage(cacheKey, { data: result.data, ts: Date.now() });
+                console.log(`🔥 Fetched ${result.data.length} users from Firebase (${scope}), cached locally`);
+                return result.data;
+            }
+        } catch (error) {
+            console.error(`Firebase fetch (${scope}) error:`, error);
+        }
+    }
+
+    // 3. Fallback: stale cache or legacy localStorage
+    if (cached && cached.data) return cached.data;
+    return getFromLocalStorage('travelBuddyUsers') || [];
+}
+
+// Force-refresh cache (call after user edits profile, signs up, etc.)
+function invalidateUsersCache() {
+    const keys = Object.keys(localStorage).filter(k => k.startsWith('tb_cache_'));
+    keys.forEach(k => localStorage.removeItem(k));
+    console.log('🗑️ Users cache invalidated');
+}
+
 // ============ Multi-Step Form Logic ============
 function updateProgress() {
     const progress = (AppState.currentStep / AppState.totalSteps) * 100;
@@ -397,6 +446,7 @@ async function handleSignup(e) {
 
             showToast('Account created successfully!', 'success');
             AppState.userData = userData;
+            invalidateUsersCache();
             showMainApp();
 
         } catch (error) {
@@ -783,6 +833,7 @@ async function saveEditedField() {
 
     loadDashboard();
     closeModal();
+    invalidateUsersCache();
     showToast('Profile updated successfully!', 'success');
 }
 
@@ -852,24 +903,8 @@ async function loadTravelBuddies() {
         </div>
     `;
 
-    let users = [];
-
-    // Fetch same-college users from Firebase or localStorage
-    if (AppState.useFirebase && window.FirebaseService) {
-        try {
-            const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
-            if (result.success) {
-                users = result.data;
-            } else {
-                users = getFromLocalStorage('travelBuddyUsers') || [];
-            }
-        } catch (error) {
-            console.error('Travel Buddies fetch error:', error);
-            users = getFromLocalStorage('travelBuddyUsers') || [];
-        }
-    } else {
-        users = getFromLocalStorage('travelBuddyUsers') || [];
-    }
+    // Fetch same-college users (cache-first — avoids Firebase on every load)
+    let users = await cachedFetchUsers('college');
 
     // Get current user's coordinates
     const userLat = parseFloat(currentUser.latitude);
@@ -1316,24 +1351,8 @@ async function findCompanions(searchLat, searchLng) {
 
 // Local fallback search — uses geohash prefix bucketing when available
 async function findCompanionsLocal(userLat, userLng, currentUser) {
-    let users = [];
-
-    // Fetch same-college users from Firebase or localStorage
-    if (AppState.useFirebase && window.FirebaseService) {
-        try {
-            const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
-            if (result.success) {
-                users = result.data;
-            } else {
-                users = getFromLocalStorage('travelBuddyUsers') || [];
-            }
-        } catch (error) {
-            console.error('Firebase fetch users error:', error);
-            users = getFromLocalStorage('travelBuddyUsers') || [];
-        }
-    } else {
-        users = getFromLocalStorage('travelBuddyUsers') || [];
-    }
+    // Fetch same-college users (cache-first — avoids Firebase on every load)
+    let users = await cachedFetchUsers('college');
 
     // Step 1: Progressive filtering with fallback
     let eligibleUsers = [];
@@ -1645,11 +1664,16 @@ const MapPageState = {
     markers: [],
     popups: [],
     users: [],
+    clusterGroup: null,
     searchMarker: null,
     searchedLat: null,
     searchedLng: null,
     isInitialized: false,
-    debounceTimer: null
+    debounceTimer: null,
+    // Sheet pagination
+    sheetPage: 0,
+    sheetPageSize: 30,
+    sheetUsers: []
 };
 
 function initMapPage() {
@@ -1736,24 +1760,8 @@ async function loadMapUsers() {
         return;
     }
 
-    let users = [];
-
-    // Fetch same-college users
-    if (AppState.useFirebase && window.FirebaseService) {
-        try {
-            const result = await FirebaseService.getUsersByCollege(currentUser.collegeName);
-            if (result.success) {
-                users = result.data;
-            } else {
-                users = getFromLocalStorage('travelBuddyUsers') || [];
-            }
-        } catch (error) {
-            console.error('Map: Firebase fetch error:', error);
-            users = getFromLocalStorage('travelBuddyUsers') || [];
-        }
-    } else {
-        users = getFromLocalStorage('travelBuddyUsers') || [];
-    }
+    // Fetch same-college users (cache-first — avoids Firebase on every load)
+    let users = await cachedFetchUsers('college');
 
     // Filter same-college users with valid coordinates
     const sameCollegeUsers = users.filter(u => {
@@ -1763,13 +1771,25 @@ async function loadMapUsers() {
         return sameCollege && hasCoords;
     });
 
-    // Clear existing markers
+    // Clear existing markers and cluster group
+    if (MapPageState.clusterGroup && MapPageState.map) {
+        MapPageState.map.removeLayer(MapPageState.clusterGroup);
+    }
     MapPageState.markers.forEach(m => { if (MapPageState.map) MapPageState.map.removeLayer(m); });
     MapPageState.popups = [];
     MapPageState.markers = [];
     MapPageState.users = sameCollegeUsers;
 
-    // Add current user marker (man standing icon)
+    // Create cluster group for user markers
+    MapPageState.clusterGroup = L.markerClusterGroup({
+        maxClusterRadius: 50,
+        spiderfyOnMaxZoom: true,
+        showCoverageOnHover: false,
+        zoomToBoundsOnClick: true,
+        disableClusteringAtZoom: 15
+    });
+
+    // Add current user marker (man standing icon) — NOT in cluster group
     if (currentUser.latitude && currentUser.longitude) {
         const lat = parseFloat(currentUser.latitude);
         const lng = parseFloat(currentUser.longitude);
@@ -1796,7 +1816,7 @@ async function loadMapUsers() {
         }
     }
 
-    // Add user markers
+    // Add user markers to cluster group
     const bounds = L.latLngBounds();
     let hasPoints = false;
 
@@ -1804,7 +1824,6 @@ async function loadMapUsers() {
         const lat = parseFloat(user.latitude);
         const lng = parseFloat(user.longitude);
 
-        // Distance from current user's destination
         const cuLat = parseFloat(currentUser.latitude);
         const cuLng = parseFloat(currentUser.longitude);
         const hasCu = !isNaN(cuLat) && !isNaN(cuLng);
@@ -1826,17 +1845,20 @@ async function loadMapUsers() {
         const popupHTML = buildPopupHTML(user, dist);
 
         const marker = L.marker([lat, lng], { icon: userIcon })
-            .bindPopup(popupHTML, { offset: [0, 0] })
-            .addTo(MapPageState.map);
+            .bindPopup(popupHTML, { offset: [0, 0] });
 
-        // Store user reference on marker for distance updates
         marker._userData = user;
 
+        // Add to cluster group instead of map directly
+        MapPageState.clusterGroup.addLayer(marker);
         MapPageState.markers.push(marker);
         MapPageState.popups.push(marker.getPopup());
         bounds.extend([lat, lng]);
         hasPoints = true;
     });
+
+    // Add cluster group to map
+    MapPageState.map.addLayer(MapPageState.clusterGroup);
 
     // Also include current user in bounds
     if (currentUser.latitude && currentUser.longitude) {
@@ -2087,12 +2109,36 @@ function renderSheetCards(users, showDistance = false) {
                 <span>No travel buddies found from your college</span>
             </div>
         `;
+        MapPageState.sheetUsers = [];
         return;
     }
 
-    body.innerHTML = users.map(user => {
+    // Store for pagination
+    MapPageState.sheetUsers = users;
+    MapPageState.sheetShowDistance = showDistance;
+    MapPageState.sheetPage = 0;
+    body.innerHTML = '';
+    renderSheetBatch();
+    setupSheetScrollObserver();
+    setupSheetDelegation();
+}
+
+// Render a batch of sheet cards (30 at a time)
+function renderSheetBatch() {
+    const body = document.getElementById('mapSheetBody');
+    const { sheetUsers, sheetPage, sheetPageSize, sheetShowDistance } = MapPageState;
+
+    const start = sheetPage * sheetPageSize;
+    const batch = sheetUsers.slice(start, start + sheetPageSize);
+    if (batch.length === 0) return;
+
+    // Remove old sentinel
+    const oldSentinel = body.querySelector('.sheet-scroll-sentinel');
+    if (oldSentinel) oldSentinel.remove();
+
+    const html = batch.map(user => {
         let distBadge = '';
-        if (showDistance && user._distance !== undefined) {
+        if (sheetShowDistance && user._distance !== undefined) {
             const d = user._distance;
             const formatted = d < 1 ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} KM`;
             distBadge = `<span class="map-sheet-card-dist">${formatted}</span>`;
@@ -2115,46 +2161,81 @@ function renderSheetCards(users, showDistance = false) {
         `;
     }).join('');
 
-    // Avatar â†’ open profile modal
-    body.querySelectorAll('.map-sheet-card-avatar').forEach(avatar => {
-        avatar.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const card = avatar.closest('.map-sheet-card');
-            const email = card.dataset.email;
-            const user = MapPageState.users.find(u => u.email === email);
-            if (user) openProfileModal(user);
-        });
-    });
+    body.insertAdjacentHTML('beforeend', html);
+    MapPageState.sheetPage++;
 
-    // Info section â†’ fly to marker on map
-    body.querySelectorAll('.map-sheet-card-info').forEach(info => {
-        info.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const card = info.closest('.map-sheet-card');
-            const lat = parseFloat(card.dataset.lat);
-            const lng = parseFloat(card.dataset.lng);
-            if (!isNaN(lat) && !isNaN(lng) && MapPageState.map) {
-                // Collapse sheet to peek while flying
-                const sheet = document.getElementById('mapBottomSheet');
-                if (sheet) {
-                    sheet.classList.remove('sheet-half', 'sheet-full');
-                    sheet.style.height = '200px';
-                }
+    // Add sentinel if more cards
+    const totalRendered = MapPageState.sheetPage * sheetPageSize;
+    if (totalRendered < sheetUsers.length) {
+        body.insertAdjacentHTML('beforeend', '<div class="sheet-scroll-sentinel" style="height:1px;"></div>');
+    }
+}
 
-                MapPageState.map.flyTo([lat, lng], 14, { duration: 1.2 });
+// Infinite scroll for sheet
+function setupSheetScrollObserver() {
+    if (MapPageState.sheetScrollObserver) {
+        MapPageState.sheetScrollObserver.disconnect();
+    }
 
-                // Restore sheet after fly completes
-                setTimeout(() => {
-                    if (sheet) sheet.style.height = '';
-                }, 1300);
-
-                const email = card.dataset.email;
-                MapPageState.markers.forEach(m => {
-                    if (m._userData && m._userData.email === email) m.openPopup();
-                });
+    const body = document.getElementById('mapSheetBody');
+    MapPageState.sheetScrollObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                renderSheetBatch();
+                const newSentinel = body.querySelector('.sheet-scroll-sentinel');
+                if (newSentinel) MapPageState.sheetScrollObserver.observe(newSentinel);
             }
         });
-    });
+    }, { root: body, rootMargin: '100px' });
+
+    const sentinel = body.querySelector('.sheet-scroll-sentinel');
+    if (sentinel) MapPageState.sheetScrollObserver.observe(sentinel);
+}
+
+// Event delegation for sheet cards (1 listener instead of N)
+function setupSheetDelegation() {
+    const body = document.getElementById('mapSheetBody');
+    body.removeEventListener('click', _sheetClickHandler);
+    body.addEventListener('click', _sheetClickHandler);
+}
+
+function _sheetClickHandler(e) {
+    const card = e.target.closest('.map-sheet-card');
+    if (!card) return;
+
+    const email = card.dataset.email;
+
+    // Avatar click → profile modal
+    if (e.target.closest('.map-sheet-card-avatar')) {
+        e.stopPropagation();
+        const user = MapPageState.users.find(u => u.email === email);
+        if (user) openProfileModal(user);
+        return;
+    }
+
+    // Info click → fly to marker
+    if (e.target.closest('.map-sheet-card-info')) {
+        e.stopPropagation();
+        const lat = parseFloat(card.dataset.lat);
+        const lng = parseFloat(card.dataset.lng);
+        if (!isNaN(lat) && !isNaN(lng) && MapPageState.map) {
+            const sheet = document.getElementById('mapBottomSheet');
+            if (sheet) {
+                sheet.classList.remove('sheet-half', 'sheet-full');
+                sheet.style.height = '200px';
+            }
+
+            MapPageState.map.flyTo([lat, lng], 14, { duration: 1.2 });
+
+            setTimeout(() => {
+                if (sheet) sheet.style.height = '';
+            }, 1300);
+
+            MapPageState.markers.forEach(m => {
+                if (m._userData && m._userData.email === email) m.openPopup();
+            });
+        }
+    }
 }
 
 function setupBottomSheetDrag() {
@@ -2937,7 +3018,13 @@ const MessagingState = {
     unsubscribePresence: null,
     typingTimeout: null,
     profileModalUser: null,
-    currentGroup: null
+    currentGroup: null,
+    // Pagination state for user list
+    allFilteredUsers: [],
+    usersPage: 0,
+    usersPageSize: 30,
+    usersScrollObserver: null,
+    searchDebounceTimer: null
 };
 
 // Initialize Pusher
@@ -3083,9 +3170,12 @@ function setupMessaging() {
         });
     });
 
-    // Search users
+    // Search users (debounced — avoids re-rendering on every keystroke)
     userSearchInput.addEventListener('input', (e) => {
-        loadUsersList(e.target.value);
+        clearTimeout(MessagingState.searchDebounceTimer);
+        MessagingState.searchDebounceTimer = setTimeout(() => {
+            loadUsersList(e.target.value);
+        }, 300);
     });
 
     // Back to messages list
@@ -3183,7 +3273,7 @@ function cleanupChatSubscriptions() {
     if (typingEl) typingEl.style.display = 'none';
 }
 
-// ============ Load Users List ============
+// ============ Load Users List (Paginated) ============
 async function loadUsersList(searchQuery = '') {
     const usersList = document.getElementById('usersList');
     const currentUser = AppState.userData;
@@ -3195,34 +3285,12 @@ async function loadUsersList(searchQuery = '') {
 
     usersList.innerHTML = '<div class="loading-users"><i class="fas fa-spinner fa-spin"></i><span>Loading users...</span></div>';
 
-    let users = [];
+    // Fetch users (cache-first — avoids Firebase on every tab switch)
+    const scope = MessagingState.currentFilter === 'myCollege' ? 'college' : 'all';
+    let users = await cachedFetchUsers(scope);
 
-    if (AppState.useFirebase && window.FirebaseService) {
-        try {
-            const result = await FirebaseService.getAllUsers();
-            if (result.success) {
-                users = result.data;
-            } else {
-                users = getFromLocalStorage('travelBuddyUsers') || [];
-            }
-        } catch (error) {
-            console.error('Firebase fetch users error:', error);
-            users = getFromLocalStorage('travelBuddyUsers') || [];
-        }
-    } else {
-        users = getFromLocalStorage('travelBuddyUsers') || [];
-    }
-
-    // Filter users
+    // Filter out current user
     let filteredUsers = users.filter(u => u.email !== currentUser.email);
-
-    // Apply tab filter
-    if (MessagingState.currentFilter === 'myCollege') {
-        filteredUsers = filteredUsers.filter(u =>
-            u.collegeName?.toLowerCase() === currentUser.collegeName?.toLowerCase() ||
-            u.startingCollege?.id === currentUser.startingCollege?.id
-        );
-    }
 
     // Apply search filter
     if (searchQuery) {
@@ -3241,6 +3309,7 @@ async function loadUsersList(searchQuery = '') {
                 <p>${MessagingState.currentFilter === 'myCollege' ? 'No users from your college yet' : 'No users found'}</p>
             </div>
         `;
+        MessagingState.allFilteredUsers = [];
         return;
     }
 
@@ -3255,12 +3324,37 @@ async function loadUsersList(searchQuery = '') {
         return lastB - lastA; // Most recent first
     });
 
+    // Store for pagination
+    MessagingState.allFilteredUsers = filteredUsers;
+    MessagingState.usersPage = 0;
+
+    // Clear list and render first batch
+    usersList.innerHTML = '';
+    renderUsersBatch();
+    setupUsersScrollObserver();
+    setupUserListDelegation();
+}
+
+// Render a batch of users (paginated — 30 at a time)
+function renderUsersBatch() {
+    const usersList = document.getElementById('usersList');
+    const currentUser = AppState.userData;
+    const { allFilteredUsers, usersPage, usersPageSize } = MessagingState;
+
+    const start = usersPage * usersPageSize;
+    const batch = allFilteredUsers.slice(start, start + usersPageSize);
+    if (batch.length === 0) return;
+
     // Pre-compute distance
     const cuLat = parseFloat(currentUser.latitude);
     const cuLng = parseFloat(currentUser.longitude);
     const hasMyCoords = !isNaN(cuLat) && !isNaN(cuLng);
 
-    usersList.innerHTML = filteredUsers.map(user => {
+    // Remove existing sentinel before appending
+    const oldSentinel = usersList.querySelector('.users-scroll-sentinel');
+    if (oldSentinel) oldSentinel.remove();
+
+    const html = batch.map(user => {
         const uLat = parseFloat(user.latitude);
         const uLng = parseFloat(user.longitude);
         let distHtml = '';
@@ -3270,7 +3364,6 @@ async function loadUsersList(searchQuery = '') {
             distHtml = `<span class="user-item-dist">${fmt}</span>`;
         }
 
-        // ===== LAST MESSAGE PREVIEW =====
         const chatKey = getChatKey(user.email);
         const msgs = MessagingState.messages[chatKey] || [];
         const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
@@ -3284,7 +3377,6 @@ async function loadUsersList(searchQuery = '') {
             previewHtml = `<p class="last-msg-preview"><i>Message deleted</i></p>`;
         }
 
-        // ===== UNREAD COUNT BADGE =====
         const unreadCount = MessagingState.unreadCounts[chatKey] || 0;
         const unreadHtml = unreadCount > 0 ? `<span class="user-item-unread">${unreadCount}</span>` : '';
 
@@ -3302,21 +3394,71 @@ async function loadUsersList(searchQuery = '') {
                 <span class="time">${getLastMessageTime(user.email)}</span>
                 ${unreadHtml || distHtml}
             </div>
-        </div>
-    `}).join('');
+        </div>`;
+    }).join('');
 
-    // Add click handlers
-    usersList.querySelectorAll('.user-item').forEach(item => {
-        item.addEventListener('click', (e) => {
-            if (e.target.classList.contains('user-avatar-img')) {
-                const user = filteredUsers.find(u => u.email === e.target.dataset.email);
-                if (user) openProfileModal(user);
-            } else {
-                const user = filteredUsers.find(u => u.email === item.dataset.email);
-                if (user) openChat(user);
+    usersList.insertAdjacentHTML('beforeend', html);
+    MessagingState.usersPage++;
+
+    // Add scroll sentinel if more users exist
+    const totalRendered = MessagingState.usersPage * usersPageSize;
+    if (totalRendered < allFilteredUsers.length) {
+        usersList.insertAdjacentHTML('beforeend', '<div class="users-scroll-sentinel" style="height:1px;"></div>');
+    }
+
+    console.log(`📋 Rendered users batch ${MessagingState.usersPage} (${Math.min(totalRendered, allFilteredUsers.length)}/${allFilteredUsers.length})`);
+}
+
+// IntersectionObserver for infinite scroll
+function setupUsersScrollObserver() {
+    // Disconnect previous observer
+    if (MessagingState.usersScrollObserver) {
+        MessagingState.usersScrollObserver.disconnect();
+    }
+
+    const usersList = document.getElementById('usersList');
+    MessagingState.usersScrollObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                renderUsersBatch();
+                // Re-observe new sentinel
+                const newSentinel = usersList.querySelector('.users-scroll-sentinel');
+                if (newSentinel) {
+                    MessagingState.usersScrollObserver.observe(newSentinel);
+                }
             }
         });
-    });
+    }, { root: usersList, rootMargin: '200px' });
+
+    const sentinel = usersList.querySelector('.users-scroll-sentinel');
+    if (sentinel) {
+        MessagingState.usersScrollObserver.observe(sentinel);
+    }
+}
+
+// Event delegation for user list (1 listener instead of N)
+function setupUserListDelegation() {
+    const usersList = document.getElementById('usersList');
+    // Remove old delegated listener to avoid duplicates
+    usersList.removeEventListener('click', _userListClickHandler);
+    usersList.addEventListener('click', _userListClickHandler);
+}
+
+function _userListClickHandler(e) {
+    // Avatar click → profile modal
+    if (e.target.classList.contains('user-avatar-img')) {
+        const email = e.target.dataset.email;
+        const user = MessagingState.allFilteredUsers.find(u => u.email === email);
+        if (user) openProfileModal(user);
+        return;
+    }
+    // Row click → open chat
+    const item = e.target.closest('.user-item');
+    if (item) {
+        const email = item.dataset.email;
+        const user = MessagingState.allFilteredUsers.find(u => u.email === email);
+        if (user) openChat(user);
+    }
 }
 
 // Helper to sanitize email for DOM id
