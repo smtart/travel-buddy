@@ -3165,6 +3165,9 @@ function setupMessaging() {
     if (AppState.useFirebase && window.FirebaseService && AppState.userData) {
         FirebaseService.setUserOnline(AppState.userData.email);
 
+        // Backfill index for existing chats (runs once — seeds user_chats for old conversations)
+        FirebaseService.backfillUserChatIndex(AppState.userData.email);
+
         // ── Efficient user-chat index listener ──
         // Reads only user_chats/{myKey} (tiny index node) — not the full /chats tree
         MessagingState.unsubscribeAllChats = FirebaseService.listenToUserChatIndex(

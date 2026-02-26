@@ -681,6 +681,58 @@ async function clearUnreadInIndex(userEmail, chatKey) {
     }
 }
 
+// Backfill user_chats index from existing /chats on first login
+// Runs once — only writes entries that are missing from the index
+async function backfillUserChatIndex(userEmail) {
+    if (!firebaseRealtimeDB || !userEmail) return;
+    const myKey = sanitizeEmailForPath(userEmail);
+
+    try {
+        // 1. Read existing index to avoid overwriting unread counts
+        const indexSnap = await firebaseRealtimeDB.ref(`user_chats/${myKey}`).once('value');
+        const existingIndex = indexSnap.val() || {};
+
+        // 2. Scan all chat keys for ones that involve this user
+        const chatsSnap = await firebaseRealtimeDB.ref('chats').once('value');
+        if (!chatsSnap.exists()) return;
+
+        const writes = {};
+
+        chatsSnap.forEach((chatChild) => {
+            const chatKey = chatChild.key;
+            // Only process chats where this user is a participant
+            if (!chatKey.includes(myKey)) return;
+            // Skip if index entry already exists (to preserve existing unread counts)
+            if (existingIndex[chatKey]) return;
+
+            const chatData = chatChild.val();
+            if (!chatData?.messages) return;
+
+            // Find the last message
+            const msgKeys = Object.keys(chatData.messages);
+            const lastMsgKey = msgKeys[msgKeys.length - 1];
+            const lastMsg = chatData.messages[lastMsgKey];
+            if (!lastMsg) return;
+
+            // Build index entry (unread = 0 since we're backfilling, not tracking history)
+            writes[`user_chats/${myKey}/${chatKey}`] = {
+                lastMsg: (lastMsg.text || '').substring(0, 60),
+                lastTimestamp: lastMsg.timestamp || new Date(0).toISOString(),
+                fromName: lastMsg.fromName || '',
+                fromEmail: lastMsg.from || '',
+                unread: 0
+            };
+        });
+
+        if (Object.keys(writes).length > 0) {
+            await firebaseRealtimeDB.ref().update(writes);
+            console.log(`✅ Backfilled ${Object.keys(writes).length} chat index entries for ${userEmail}`);
+        }
+    } catch (e) {
+        console.warn('backfillUserChatIndex error:', e);
+    }
+}
+
 // Get messages once
 async function getMessages(chatKey) {
     try {
@@ -1143,6 +1195,7 @@ window.FirebaseService = {
     leaveGroup,
     listenToGroupMessages,
     sendGroupMessage,
-    listenToAllUserChats
+    listenToAllUserChats: () => { }, // deprecated — kept for safety
+    backfillUserChatIndex
 };
 
