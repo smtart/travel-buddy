@@ -4153,6 +4153,9 @@ async function loadGroupSuggestions() {
         return;
     }
 
+    // Track groups the user has joined this session (prevents banner flicker)
+    if (!MessagingState.joinedGroupIds) MessagingState.joinedGroupIds = new Set();
+
     try {
         const result = await FirebaseService.findMatchingGroups(user.collegeName, user.destinationGeohash);
         if (!result.success || result.data.length === 0) {
@@ -4160,9 +4163,15 @@ async function loadGroupSuggestions() {
             return;
         }
 
-        // Filter out groups user is already in
+        // Filter out groups user is already in (Firebase data) AND locally joined groups
         const myKey = sanitizeEmailForPresence(user.email);
-        const suggestions = result.data.filter(g => !g.members || !g.members[myKey]);
+        const suggestions = result.data.filter(g => {
+            // Skip if user already a member in Firebase data
+            if (g.members && g.members[myKey]) return false;
+            // Skip if user joined this session (local tracking)
+            if (MessagingState.joinedGroupIds.has(g.id)) return false;
+            return true;
+        });
 
         if (suggestions.length === 0) {
             area.innerHTML = '';
@@ -4188,6 +4197,8 @@ async function loadGroupSuggestions() {
             e.stopPropagation();
             const res = await FirebaseService.joinGroup(group.id, user.email);
             if (res.success) {
+                // Track locally so banner won't reappear
+                MessagingState.joinedGroupIds.add(group.id);
                 showToast('Joined group!', 'success');
                 area.innerHTML = '';
                 // If on groups tab, refresh
